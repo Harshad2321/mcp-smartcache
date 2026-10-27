@@ -9,6 +9,9 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, Tool as MCPTool
 from gateway.registry import ServerRegistry, RegisteredTool
 from gateway.router import GatewayRouter
+from gateway.cache_policy import CachePolicyRegistry
+from gateway.cache_store import RedisCacheStore
+from gateway.singleflight import Singleflight
 
 
 class GatewayMCPServer(MCPServer):
@@ -37,15 +40,34 @@ class GatewayMCPServer(MCPServer):
         name: str,
         arguments: Dict[str, Any],
         context: Optional[Any] = None,
+        scope: str = "none",
     ) -> CallToolResult:
         """Route tool invocation to upstream server via GatewayRouter."""
-        return await self.router.route_tool_call(name, arguments)
+        return await self.router.route_tool_call(name, arguments, scope=scope)
 
 
 class GatewayService:
-    """Core Gateway orchestrator combining Registry, Router, and MCP Server."""
+    """
+    Core Gateway orchestrator combining Registry, Router, MCP Server,
+    Cache Policy Registry, Redis Cache Store, and Singleflight.
 
-    def __init__(self):
+    Phase 2: cache_store is optional — when None, caching is disabled
+    even for tools with enabled policies (graceful degradation).
+    """
+
+    def __init__(
+        self,
+        cache_store: Optional[RedisCacheStore] = None,
+        policy_registry: Optional[CachePolicyRegistry] = None,
+    ) -> None:
         self.registry = ServerRegistry()
-        self.router = GatewayRouter(self.registry)
+        self.policy_registry: CachePolicyRegistry = policy_registry or CachePolicyRegistry()
+        self.cache_store: Optional[RedisCacheStore] = cache_store
+        self.singleflight: Singleflight = Singleflight()
+        self.router = GatewayRouter(
+            registry=self.registry,
+            policy_registry=self.policy_registry,
+            cache_store=self.cache_store,
+            singleflight=self.singleflight,
+        )
         self.mcp_server = GatewayMCPServer(self.router)

@@ -36,6 +36,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_password@postgres:5432/mcp_smartcache
       PYTHONPATH: /app
+      ENVIRONMENT: development
+      ENABLE_DEV_MOCKS: "true"
+      AUTH_ENABLED: "true"
+      GATEWAY_ADMIN_API_KEY: dev-admin-secret-key-32chars-long
+      GATEWAY_CLIENT_API_KEY: dev-client-secret-key-32chars-long
     volumes:
       - .:/app
     ports:
@@ -84,6 +89,7 @@ services:
     environment:
       GATEWAY_MCP_URL: http://gateway:8000
       PYTHONPATH: /app
+      GATEWAY_API_KEY: dev-client-secret-key-32chars-long
     volumes:
       - .:/app
     ports:

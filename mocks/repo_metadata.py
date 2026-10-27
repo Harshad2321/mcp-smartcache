@@ -27,6 +27,11 @@ class MockRepoMetadataServer:
         }
         self.mcp_server = self._build_mcp_server()
 
+    @property
+    def call_count(self) -> int:
+        """Total calls across all tools on this mock server."""
+        return sum(self.call_counters.values())
+
     def reset_counters(self) -> None:
         """Reset call counters."""
         for k in self.call_counters:
