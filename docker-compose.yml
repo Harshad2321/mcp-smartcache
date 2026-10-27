@@ -35,6 +35,9 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_password@postgres:5432/mcp_smartcache
+      PYTHONPATH: /app
+    volumes:
+      - .:/app
     ports:
       - "8000:8000"
     depends_on:
@@ -57,6 +60,9 @@ services:
     container_name: mcp-smartcache-control-api
     environment:
       DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_password@postgres:5432/mcp_smartcache
+      PYTHONPATH: /app
+    volumes:
+      - .:/app
     ports:
       - "8080:8080"
     depends_on:
@@ -77,6 +83,9 @@ services:
     container_name: mcp-smartcache-runtime
     environment:
       GATEWAY_MCP_URL: http://gateway:8000
+      PYTHONPATH: /app
+    volumes:
+      - .:/app
     ports:
       - "8002:8002"
     depends_on:
