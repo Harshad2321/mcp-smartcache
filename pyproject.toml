@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-smartcache"
+version = "0.1.0"
+description = "MCP SmartCache: Gateway and LangGraph Agent Runtime for Agentic Tool Orchestration"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp==2.3.0",
+    "langgraph==1.2.18",
+    "langchain-core==1.7.0",
+    "fastapi==0.162.0",
+    "uvicorn==0.54.0",
+    "redis==8.1.0",
+    "asyncpg==0.32.0",
+    "sqlalchemy==2.1.6",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.1",
+    "opentelemetry-api==1.45.1",
+    "opentelemetry-sdk==1.45.1",
+    "prometheus-client==0.26.0",
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gateway*", "runtime*", "control_api*", "storage*", "observability*", "mocks*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
