@@ -237,3 +237,52 @@ class TestRedisCacheStoreIntegration:
         members = await store._client.smembers(idx_key)
         for key in keys:
             assert key in members, f"Missing index entry for {key}"
+
+    async def test_tenant_scoped_invalidation_does_not_cross_boundaries(self, store):
+        """Invalidating a tool for Tenant A must NOT delete Tenant B's cached entry."""
+        tool_name = "svc__tenant_tool"
+        key_a = "mcp-sc:v1:1:tenant-a:hashA"
+        key_b = "mcp-sc:v1:1:tenant-b:hashB"
+
+        await store.set(key_a, _make_result("tenant-a-data"), ttl_seconds=60, tool_name=tool_name, scope="tenant-a")
+        await store.set(key_b, _make_result("tenant-b-data"), ttl_seconds=60, tool_name=tool_name, scope="tenant-b")
+
+        # Both must exist
+        assert await store.get(key_a) is not None
+        assert await store.get(key_b) is not None
+
+        # Invalidate only for Tenant A
+        deleted = await store.invalidate_tool(tool_name, scope="tenant-a")
+        assert deleted == 1
+
+        # Key A must be deleted
+        assert await store.get(key_a) is None
+        # Key B MUST STILL EXIST!
+        assert await store.get(key_b) is not None
+
+        # Clean up Key B
+        await store.invalidate_tool(tool_name, scope="tenant-b")
+        assert await store.get(key_b) is None
+
+    async def test_tenant_scoped_tag_invalidation_does_not_cross_boundaries(self, store):
+        """Invalidating a tag for Tenant A must NOT delete Tenant B's tagged entry."""
+        tag = "tenant-tag"
+        key_a = "mcp-sc:v1:1:tenant-a:tagHashA"
+        key_b = "mcp-sc:v1:1:tenant-b:tagHashB"
+
+        await store.set(key_a, _make_result("tenant-a-tag"), ttl_seconds=60, tags=frozenset([tag]), scope="tenant-a")
+        await store.set(key_b, _make_result("tenant-b-tag"), ttl_seconds=60, tags=frozenset([tag]), scope="tenant-b")
+
+        assert await store.get(key_a) is not None
+        assert await store.get(key_b) is not None
+
+        # Invalidate tag for Tenant A only
+        deleted = await store.invalidate_tag(tag, scope="tenant-a")
+        assert deleted == 1
+
+        # Tenant A's entry deleted, Tenant B's entry preserved
+        assert await store.get(key_a) is None
+        assert await store.get(key_b) is not None
+
+        await store.invalidate_tag(tag, scope="tenant-b")
+        assert await store.get(key_b) is None

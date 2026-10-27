@@ -174,14 +174,13 @@ class RedisCacheStore:
         tool_name: Optional[str] = None,
         tags: Optional[frozenset[str]] = None,
         max_bytes: int = 512 * 1024,
+        scope: Optional[str] = None,
     ) -> bool:
         """
         Store a result with TTL. Returns True on success, False if oversized.
         Raises CacheError on Redis failure.
 
-        Also maintains per-tool and per-tag index Sets for safe invalidation.
-        The index Set TTL is extended to ttl_seconds * 2 to account for the
-        possibility that entries outlive the per-tool index entry.
+        Maintains global and tenant-isolated index Sets for safe invalidation.
         """
         client = self._require_client()
 
@@ -199,17 +198,27 @@ class RedisCacheStore:
             pipe = client.pipeline(transaction=False)
             pipe.set(key, payload, ex=ttl_seconds)
 
-            # Maintain per-tool index.
+            # Maintain per-tool index (global and tenant-scoped)
             if tool_name:
                 idx_key = build_tool_index_key(tool_name)
                 pipe.sadd(idx_key, key)
                 pipe.expire(idx_key, ttl_seconds * 2)
 
-            # Maintain per-tag indexes.
+                if scope and scope != "*":
+                    scoped_idx = build_tool_index_key(tool_name, scope=scope)
+                    pipe.sadd(scoped_idx, key)
+                    pipe.expire(scoped_idx, ttl_seconds * 2)
+
+            # Maintain per-tag indexes (global and tenant-scoped)
             for tag in (tags or frozenset()):
                 tag_key = build_tag_index_key(tag)
                 pipe.sadd(tag_key, key)
                 pipe.expire(tag_key, ttl_seconds * 2)
+
+                if scope and scope != "*":
+                    scoped_tag = build_tag_index_key(tag, scope=scope)
+                    pipe.sadd(scoped_tag, key)
+                    pipe.expire(scoped_tag, ttl_seconds * 2)
 
             await pipe.execute()
             return True
@@ -224,18 +233,14 @@ class RedisCacheStore:
         except RedisError as err:
             raise CacheError(f"Redis DELETE failed for key={key}: {err}") from err
 
-    async def invalidate_tool(self, namespaced_tool_name: str) -> int:
+    async def invalidate_tool(self, namespaced_tool_name: str, scope: Optional[str] = None) -> int:
         """
-        Delete all cached entries for a specific tool via the index Set.
+        Delete cached entries for a specific tool.
+        If scope is provided, only deletes entries for that tenant.
         Returns number of entries deleted.
-        Raises CacheError on Redis failure.
-
-        This is O(N) where N is the number of cached entries for this tool —
-        typically small and bounded by the tool's cardinality.
-        Never uses KEYS * or full-keyspace scans.
         """
         client = self._require_client()
-        idx_key = build_tool_index_key(namespaced_tool_name)
+        idx_key = build_tool_index_key(namespaced_tool_name, scope=scope)
         try:
             members = await client.smembers(idx_key)
             if not members:
@@ -244,21 +249,28 @@ class RedisCacheStore:
             for member in members:
                 pipe.delete(member)
             pipe.delete(idx_key)
+
+            # Also clear from global tool index if this was a scoped invalidation
+            if scope and scope != "*":
+                global_idx = build_tool_index_key(namespaced_tool_name)
+                pipe.srem(global_idx, *members)
+
             results = await pipe.execute()
             # results is a list of ints (DEL return values) + final DEL for idx.
-            return sum(r for r in results[:-1] if isinstance(r, int))
+            return sum(r for r in results[:len(members)] if isinstance(r, int))
         except RedisError as err:
             raise CacheError(
-                f"Redis invalidation failed for tool={namespaced_tool_name}: {err}"
+                f"Redis invalidation failed for tool={namespaced_tool_name} scope={scope}: {err}"
             ) from err
 
-    async def invalidate_tag(self, tag: str) -> int:
+    async def invalidate_tag(self, tag: str, scope: Optional[str] = None) -> int:
         """
-        Delete all cached entries for a tag group.
+        Delete cached entries for a tag group.
+        If scope is provided, only deletes entries for that tenant.
         Returns number of entries deleted.
         """
         client = self._require_client()
-        tag_key = build_tag_index_key(tag)
+        tag_key = build_tag_index_key(tag, scope=scope)
         try:
             members = await client.smembers(tag_key)
             if not members:
@@ -267,7 +279,12 @@ class RedisCacheStore:
             for member in members:
                 pipe.delete(member)
             pipe.delete(tag_key)
+
+            if scope and scope != "*":
+                global_tag = build_tag_index_key(tag)
+                pipe.srem(global_tag, *members)
+
             results = await pipe.execute()
-            return sum(r for r in results[:-1] if isinstance(r, int))
+            return sum(r for r in results[:len(members)] if isinstance(r, int))
         except RedisError as err:
-            raise CacheError(f"Redis tag invalidation failed for tag={tag}: {err}") from err
+            raise CacheError(f"Redis tag invalidation failed for tag={tag} scope={scope}: {err}") from err

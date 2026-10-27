@@ -228,14 +228,25 @@ class GatewayRouter:
 
             # Step 10: Cache the successful eligible result.
             try:
-                wrote = await self.cache_store.set(
-                    cache_key,
-                    result,
-                    ttl_seconds=policy.ttl_seconds,
-                    tool_name=namespaced_name,
-                    tags=policy.invalidation_tags,
-                    max_bytes=policy.max_response_bytes,
-                )
+                try:
+                    wrote = await self.cache_store.set(
+                        cache_key,
+                        result,
+                        ttl_seconds=policy.ttl_seconds,
+                        tool_name=namespaced_name,
+                        tags=policy.invalidation_tags,
+                        max_bytes=policy.max_response_bytes,
+                        scope=scope,
+                    )
+                except TypeError:
+                    wrote = await self.cache_store.set(
+                        cache_key,
+                        result,
+                        ttl_seconds=policy.ttl_seconds,
+                        tool_name=namespaced_name,
+                        tags=policy.invalidation_tags,
+                        max_bytes=policy.max_response_bytes,
+                    )
                 if wrote:
                     metrics.record_write(namespaced_name)
                 else:

@@ -65,6 +65,7 @@ class FakeCacheStore:
         tool_name: Optional[str] = None,
         tags=None,
         max_bytes: int = 512 * 1024,
+        scope: Optional[str] = None,
     ) -> bool:
         self.set_call_count += 1
         if self.fail_set:
@@ -78,10 +79,23 @@ class FakeCacheStore:
         self._data[key] = result
         return True
 
-    async def invalidate_tool(self, name: str) -> int:
-        count = sum(1 for _ in list(self._data.keys()) if True)
-        self._data.clear()
-        return count
+    async def invalidate_tool(self, name: str, scope: Optional[str] = None) -> int:
+        if scope and scope != "*":
+            target_keys = [k for k in self._data if f":{scope}:" in k]
+        else:
+            target_keys = list(self._data.keys())
+        for k in target_keys:
+            del self._data[k]
+        return len(target_keys)
+
+    async def invalidate_tag(self, tag: str, scope: Optional[str] = None) -> int:
+        if scope and scope != "*":
+            target_keys = [k for k in self._data if f":{scope}:" in k]
+        else:
+            target_keys = list(self._data.keys())
+        for k in target_keys:
+            del self._data[k]
+        return len(target_keys)
 
 
 # ── Router factory helpers ────────────────────────────────────────────────────

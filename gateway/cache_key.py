@@ -21,7 +21,7 @@ Safety properties:
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Optional
 
 from gateway.cache_policy import CachePolicy, POLICY_SCHEMA_VERSION
 
@@ -92,20 +92,24 @@ def build_cache_key(
     return f"{_KEY_NAMESPACE}:{_KEY_VERSION}:{POLICY_SCHEMA_VERSION}:{scope}:{digest}"
 
 
-def build_tag_index_key(tag: str) -> str:
+def build_tag_index_key(tag: str, scope: Optional[str] = None) -> str:
     """
     Build the Redis Set key that stores all cache entry keys for a given tag.
     Used for tag-based invalidation.
-    Limit cardinality: tags must be short alphanumeric identifiers.
+    If scope is provided, builds a tenant-isolated tag index.
     """
+    if scope and scope != "*":
+        return f"{_KEY_NAMESPACE}:tag:{scope}:{tag}"
     return f"{_KEY_NAMESPACE}:tag:{tag}"
 
 
-def build_tool_index_key(namespaced_tool_name: str) -> str:
+def build_tool_index_key(namespaced_tool_name: str, scope: Optional[str] = None) -> str:
     """
     Build the Redis Set key that indexes all cache keys for a given tool.
     Used for per-tool invalidation.
+    If scope is provided, builds a tenant-isolated tool index.
     """
-    # Replace __ with . to keep it Redis-key-safe and readable.
     safe_name = namespaced_tool_name.replace("__", ".")
+    if scope and scope != "*":
+        return f"{_KEY_NAMESPACE}:idx:{scope}:{safe_name}"
     return f"{_KEY_NAMESPACE}:idx:{safe_name}"

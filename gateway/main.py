@@ -18,7 +18,7 @@ import re
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Request, Response, Security, Depends
+from fastapi import FastAPI, HTTPException, Request, Response, Security, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -394,14 +394,16 @@ async def get_cache_policy(
 @app.delete("/cache/invalidate/tool/{tool_name:path}")
 async def invalidate_tool_cache(
     tool_name: str,
+    tenant_id: Optional[str] = Query(None, description="Optional tenant ID scope for isolation"),
     auth: AuthContext = Depends(require_admin),
 ):
-    """Invalidate all cached entries for a specific tool (ADMIN only)."""
+    """Invalidate cached entries for a specific tool (ADMIN only). Can be scoped to a specific tenant."""
     if gateway_service.cache_store is None:
         raise HTTPException(status_code=503, detail="Cache store not available.")
+    target_scope = tenant_id or (auth.tenant_id if auth.tenant_id != "default" else None)
     try:
-        deleted = await gateway_service.cache_store.invalidate_tool(tool_name)
-        return {"deleted_entries": deleted, "tool": tool_name}
+        deleted = await gateway_service.cache_store.invalidate_tool(tool_name, scope=target_scope)
+        return {"deleted_entries": deleted, "tool": tool_name, "tenant_id": target_scope or "*"}
     except CacheError as err:
         raise HTTPException(status_code=503, detail=str(err))
 
@@ -409,9 +411,10 @@ async def invalidate_tool_cache(
 @app.delete("/cache/invalidate/tag/{tag}")
 async def invalidate_tag_cache(
     tag: str,
+    tenant_id: Optional[str] = Query(None, description="Optional tenant ID scope for isolation"),
     auth: AuthContext = Depends(require_admin),
 ):
-    """Invalidate all cached entries for a tag group (ADMIN only)."""
+    """Invalidate cached entries for a tag group (ADMIN only). Can be scoped to a specific tenant."""
     if not TAG_REGEX.match(tag):
         raise HTTPException(
             status_code=400,
@@ -419,9 +422,10 @@ async def invalidate_tag_cache(
         )
     if gateway_service.cache_store is None:
         raise HTTPException(status_code=503, detail="Cache store not available.")
+    target_scope = tenant_id or (auth.tenant_id if auth.tenant_id != "default" else None)
     try:
-        deleted = await gateway_service.cache_store.invalidate_tag(tag)
-        return {"deleted_entries": deleted, "tag": tag}
+        deleted = await gateway_service.cache_store.invalidate_tag(tag, scope=target_scope)
+        return {"deleted_entries": deleted, "tag": tag, "tenant_id": target_scope or "*"}
     except CacheError as err:
         raise HTTPException(status_code=503, detail=str(err))
 

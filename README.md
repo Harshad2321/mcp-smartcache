@@ -112,7 +112,27 @@ Prometheus metrics exposed at `GET /metrics` with bounded-cardinality labels (`s
 - `mcp_smartcache_upstream_duration_seconds` (Histogram)
 - `mcp_smartcache_cache_lookup_duration_seconds` (Histogram)
 
-### 6. Verification & Operational Testing
+### 6. Authentication, Authorization & Multi-Tenant Security Boundary
+
+The Gateway enforces a strict production security boundary:
+- **Role-Based Access Control**:
+  - **ADMIN Role** (`GATEWAY_ADMIN_API_KEY`): Required for cache policy registration (`POST /cache/policy`), cache invalidation (`DELETE /cache/invalidate/...`), and Prometheus metrics scraping (`GET /metrics`). Admin keys can also invalidate cache globally or for a specific tenant.
+  - **CLIENT Role** (`GATEWAY_CLIENT_API_KEY` or `CLIENT_TENANT_KEYS`): Allowed for tool discovery (`GET /tools`), status inspection (`GET /status`), and tool invocation (`POST /call`).
+  - **Public**: Health liveness probe (`GET /health`) only.
+- **Strict Tenant Authorization & Key Binding**:
+  - Client API keys are cryptographically bound to authorized tenant IDs.
+  - A client cannot choose arbitrary tenant IDs by manipulating the `X-Tenant-ID` header. Header tampering or requests for unauthorized tenants are immediately rejected with `403 Forbidden`.
+  - When `X-Tenant-ID` is omitted, requests automatically and safely default to the client's bound tenant scope.
+  - The cache key digest binds the tenant scope (`mcp-sc:v1:1:<tenant_id>:<sha256>`).
+  - Identical calls from distinct tenants never share cache entries or bleed data across boundaries.
+- **Tenant-Scoped Invalidation**:
+  - Secondary Redis Set indexes include the tenant scope (`mcp-sc:idx:<tenant_id>:<tool>`).
+  - Invalidation for Tenant A removes only Tenant A's cached entries and leaves Tenant B's cached entries intact.
+- **Production Secret & Upstream Isolation**:
+  - `ENVIRONMENT=production`: Mock servers are **strictly excluded**. Upstream MCP servers must be explicitly configured via `UPSTREAM_CONFIG_PATH`. The application refuses to start unauthenticated or with development secret placeholders (`dev-*`, `test-*`).
+  - `ENVIRONMENT=development` (`ENABLE_DEV_MOCKS=true`): Safe development mock servers are loaded for automated test harnesses and local development.
+
+### 7. Verification & Operational Testing
 
 #### Running the Full Test Suite
 ```bash
@@ -121,9 +141,10 @@ docker compose exec gateway pytest -v
 
 #### End-to-End Gateway API Verification via cURL
 
-1. **Register Cache Policy for a Tool:**
+1. **Register Cache Policy for a Tool (Requires ADMIN Key):**
 ```bash
 curl -X POST http://localhost:8000/cache/policy \
+  -H "Authorization: Bearer dev-admin-secret-key-32chars-long" \
   -H "Content-Type: application/json" \
   -d '{
     "tool_name": "repo_metadata__get_repo_info",
@@ -136,9 +157,11 @@ curl -X POST http://localhost:8000/cache/policy \
   }'
 ```
 
-2. **Execute First Tool Call (Cache Miss & Upstream Execution):**
+2. **Execute First Tool Call as Tenant A (Cache Miss & Upstream Execution):**
 ```bash
 curl -X POST http://localhost:8000/call \
+  -H "Authorization: Bearer dev-client-secret-key-32chars-long" \
+  -H "X-Tenant-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "tool": "repo_metadata__get_repo_info",
@@ -146,9 +169,11 @@ curl -X POST http://localhost:8000/call \
   }'
 ```
 
-3. **Execute Second Tool Call (Instant Cache Hit):**
+3. **Execute Second Tool Call as Tenant A (Instant Cache Hit):**
 ```bash
 curl -X POST http://localhost:8000/call \
+  -H "Authorization: Bearer dev-client-secret-key-32chars-long" \
+  -H "X-Tenant-ID: default" \
   -H "Content-Type: application/json" \
   -d '{
     "tool": "repo_metadata__get_repo_info",
@@ -156,16 +181,32 @@ curl -X POST http://localhost:8000/call \
   }'
 ```
 
-4. **Verify Telemetry & Cache Metrics:**
+4. **Verify Unauthorized Tenant Request is Rejected (403 Forbidden):**
 ```bash
-curl -s http://localhost:8000/metrics | grep mcp_smartcache_
+# Attempting to access an unauthorized tenant using a single-tenant or unassigned key returns 403:
+curl -i -X POST http://localhost:8000/call \
+  -H "Authorization: Bearer dev-client-secret-key-32chars-long" \
+  -H "X-Tenant-ID: unauthorized-tenant" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tool": "repo_metadata__get_repo_info",
+    "arguments": {"owner": "acme", "repo": "core-engine"}
+  }'
 ```
 
-5. **Invalidate Tool Cache:**
+5. **Verify Telemetry & Cache Metrics (Requires ADMIN Key):**
 ```bash
-curl -X DELETE http://localhost:8000/cache/invalidate/tool/repo_metadata__get_repo_info
+curl -s -H "Authorization: Bearer dev-admin-secret-key-32chars-long" http://localhost:8000/metrics | grep mcp_smartcache_
 ```
 
-### 7. Known Limitations
-- **In-process singleflight**: Coalescing is within a single gateway process. Multi-replica distributed singleflight requires distributed locking (planned for future phases).
-- **Authorization Scope**: Current implementation uses `scope="none"`. Full multi-tenant isolation will be wired to real auth identity tokens in Phase 4.
+6. **Invalidate Tool Cache (Admin Only, Supports Optional `tenant_id` Query Parameter):**
+```bash
+curl -X DELETE "http://localhost:8000/cache/invalidate/tool/repo_metadata__get_repo_info?tenant_id=default" \
+  -H "Authorization: Bearer dev-admin-secret-key-32chars-long"
+```
+
+### 8. Production Readiness & Known Deployment Blockers
+
+- **In-process singleflight**: Request coalescing operates in-process per gateway replica. Multi-instance horizontal scaling requires distributed lock coordination (e.g., Redis distributed lock) before high-traffic multi-pod deployment.
+- **Dynamic Upstream Discovery**: In production, upstream MCP servers currently require static configuration via `UPSTREAM_CONFIG_PATH` or startup registration; dynamic runtime discovery via PostgreSQL configuration will be completed in Phase 4.
+- **External Identity Provider**: Current authentication uses robust, constant-time API keys and validated tenant scopes. Full OAuth2/OIDC JWT token validation against an external enterprise IdP will be completed in the Phase 4 control plane.

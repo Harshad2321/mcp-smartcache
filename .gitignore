@@ -42,3 +42,12 @@ dashboard/node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets and environment configurations
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+secrets/
