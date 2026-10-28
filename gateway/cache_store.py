@@ -23,6 +23,7 @@ Graceful degradation:
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import redis.asyncio as aioredis
@@ -99,6 +100,11 @@ class RedisCacheStore:
     def __init__(self, redis_url: str) -> None:
         self._redis_url = redis_url
         self._client: Optional[aioredis.Redis] = None
+
+    @property
+    def redis(self) -> Optional[aioredis.Redis]:
+        """Expose raw Redis client for distributed locks, pubsub, and health checks."""
+        return self._client
 
     @classmethod
     def from_env(cls) -> "RedisCacheStore":
@@ -242,6 +248,12 @@ class RedisCacheStore:
         client = self._require_client()
         idx_key = build_tool_index_key(namespaced_tool_name, scope=scope)
         try:
+            # Record invalidation timestamp for distributed singleflight race checks
+            now_ts = str(time.time())
+            await client.set(f"mcp-sc:inv_ts:{namespaced_tool_name}:{scope or '*'}", now_ts, ex=300)
+            if scope and scope != "*":
+                await client.set(f"mcp-sc:inv_ts:{namespaced_tool_name}:*", now_ts, ex=300)
+
             members = await client.smembers(idx_key)
             if not members:
                 return 0

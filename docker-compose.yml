@@ -65,7 +65,14 @@ services:
     container_name: mcp-smartcache-control-api
     environment:
       DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_password@postgres:5432/mcp_smartcache
+      REDIS_URL: redis://redis:6379/0
+      GATEWAY_MCP_URL: http://gateway:8000
       PYTHONPATH: /app
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      GATEWAY_ADMIN_API_KEY: ${GATEWAY_ADMIN_API_KEY:-dev-admin-secret-key-32chars-long}
+      GATEWAY_CLIENT_API_KEY: ${GATEWAY_CLIENT_API_KEY:-dev-client-secret-key-32chars-long}
+      CLIENT_TENANT_KEYS: ${CLIENT_TENANT_KEYS:-dev-client-secret-key-32chars-long:tenant_a,dev-client-secret-key-tenant-b-32ch:tenant_b}
     volumes:
       - .:/app
     ports:
@@ -87,6 +94,7 @@ services:
       dockerfile: runtime/Dockerfile
     container_name: mcp-smartcache-runtime
     environment:
+      DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_password@postgres:5432/mcp_smartcache
       GATEWAY_MCP_URL: http://gateway:8000
       PYTHONPATH: /app
       GATEWAY_API_KEY: ${GATEWAY_CLIENT_API_KEY:-dev-client-secret-key-32chars-long}
@@ -96,6 +104,8 @@ services:
       - "8002:8002"
     depends_on:
       gateway:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
@@ -110,6 +120,9 @@ services:
       context: .
       dockerfile: dashboard/Dockerfile
     container_name: mcp-smartcache-dashboard
+    volumes:
+      - ./dashboard:/app
+      - /app/node_modules
     ports:
       - "5173:5173"
     healthcheck:

@@ -79,6 +79,70 @@ upstream_execution_failures = Counter(
     ["service", "tool_category"],
 )
 
+# ── Distributed Singleflight counters (Phase 5) ──────────────────────────────
+distributed_leaders = Counter(
+    "mcp_smartcache_distributed_leaders_total",
+    "Distributed requests that acquired the Redis lease and became leader",
+    ["service", "tool_category"],
+)
+distributed_waiters = Counter(
+    "mcp_smartcache_distributed_waiters_total",
+    "Distributed requests that waited for a cross-replica leader",
+    ["service", "tool_category"],
+)
+lock_acquisition_failures = Counter(
+    "mcp_smartcache_lock_acquisition_failures_total",
+    "Failures to acquire distributed lease due to contention or error",
+    ["service", "tool_category"],
+)
+lease_expirations = Counter(
+    "mcp_smartcache_lease_expirations_total",
+    "Distributed leases that expired before clean release",
+    ["service", "tool_category"],
+)
+waiter_timeouts = Counter(
+    "mcp_smartcache_waiter_timeouts_total",
+    "Distributed waiters that timed out waiting for leader completion",
+    ["service", "tool_category"],
+)
+coordination_fallbacks = Counter(
+    "mcp_smartcache_coordination_fallbacks_total",
+    "Requests falling back to process-local singleflight due to Redis outage or timeout",
+    ["service", "tool_category"],
+)
+
+# ── Policy & Quota counters (Phase 6) ─────────────────────────────────────────
+policy_evaluations = Counter(
+    "mcp_smartcache_policy_evaluations_total",
+    "Total policy evaluation attempts",
+    ["decision"],  # decision: allow | deny
+)
+policy_denials = Counter(
+    "mcp_smartcache_policy_denials_total",
+    "Policy denials by rule type",
+    ["reason"],  # reason: tool_denied | not_allowed | default_deny
+)
+quota_rejections = Counter(
+    "mcp_smartcache_quota_rejections_total",
+    "Quota rejections by limit type",
+    ["limit_type"],  # limit_type: rate_limit | concurrency | workflow_tasks
+)
+payload_size_rejections = Counter(
+    "mcp_smartcache_payload_size_rejections_total",
+    "Payload size limit violations",
+    ["direction"],  # direction: input | output
+)
+cache_eligibility_decisions = Counter(
+    "mcp_smartcache_cache_eligibility_decisions_total",
+    "Decisions regarding tool cache eligibility",
+    ["decision"],  # decision: eligible | ineligible | disabled
+)
+policy_refresh_failures = Counter(
+    "mcp_smartcache_policy_refresh_failures_total",
+    "Failures during dynamic policy refresh",
+    ["reason"],  # reason: db_error | validation_error | parse_error
+)
+
 # ── Latency histograms ────────────────────────────────────────────────────────
 upstream_duration_seconds = Histogram(
     "mcp_smartcache_upstream_duration_seconds",
@@ -156,6 +220,39 @@ def record_singleflight_waiter(namespaced_name: str) -> None:
     logger.debug("singleflight_waiter tool=%s", namespaced_name)
 
 
+def record_distributed_leader(namespaced_name: str) -> None:
+    service, tool_cat = _parse_labels(namespaced_name)
+    distributed_leaders.labels(service=service, tool_category=tool_cat).inc()
+    logger.debug("distributed_leader tool=%s", namespaced_name)
+
+
+def record_distributed_waiter(namespaced_name: str) -> None:
+    service, tool_cat = _parse_labels(namespaced_name)
+    distributed_waiters.labels(service=service, tool_category=tool_cat).inc()
+    logger.debug("distributed_waiter tool=%s", namespaced_name)
+
+
+def record_lock_failure(namespaced_name: str) -> None:
+    service, tool_cat = _parse_labels(namespaced_name)
+    lock_acquisition_failures.labels(service=service, tool_category=tool_cat).inc()
+
+
+def record_lease_expiration(namespaced_name: str) -> None:
+    service, tool_cat = _parse_labels(namespaced_name)
+    lease_expirations.labels(service=service, tool_category=tool_cat).inc()
+
+
+def record_waiter_timeout(namespaced_name: str) -> None:
+    service, tool_cat = _parse_labels(namespaced_name)
+    waiter_timeouts.labels(service=service, tool_category=tool_cat).inc()
+
+
+def record_fallback(namespaced_name: str) -> None:
+    service, tool_cat = _parse_labels(namespaced_name)
+    coordination_fallbacks.labels(service=service, tool_category=tool_cat).inc()
+    logger.debug("coordination_fallback tool=%s", namespaced_name)
+
+
 def record_upstream_failure(namespaced_name: str) -> None:
     service, tool_cat = _parse_labels(namespaced_name)
     upstream_execution_failures.labels(service=service, tool_category=tool_cat).inc()
@@ -181,3 +278,28 @@ def measure_cache_lookup(namespaced_name: str) -> Generator[None, None, None]:
     finally:
         elapsed = time.perf_counter() - start
         cache_lookup_duration_seconds.labels(service=service, tool_category=tool_cat).observe(elapsed)
+
+
+def record_policy_eval(decision: str) -> None:
+    policy_evaluations.labels(decision=decision).inc()
+
+
+def record_policy_denial(reason: str) -> None:
+    policy_denials.labels(reason=reason).inc()
+
+
+def record_quota_rejection(limit_type: str) -> None:
+    quota_rejections.labels(limit_type=limit_type).inc()
+
+
+def record_payload_rejection(direction: str) -> None:
+    payload_size_rejections.labels(direction=direction).inc()
+
+
+def record_cache_eligibility(decision: str) -> None:
+    cache_eligibility_decisions.labels(decision=decision).inc()
+
+
+def record_policy_refresh_failure(reason: str) -> None:
+    policy_refresh_failures.labels(reason=reason).inc()
+

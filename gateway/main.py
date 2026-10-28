@@ -29,6 +29,8 @@ from gateway.server import GatewayService
 from gateway.registry import ServerConfig
 from gateway.cache_policy import CachePolicy, CachePolicyRegistry
 from gateway.cache_store import RedisCacheStore, CacheError
+from gateway.policy_engine import policy_engine
+from gateway.quota_manager import quota_manager
 from gateway.auth import (
     AuthContext,
     Role,
@@ -216,6 +218,10 @@ async def lifespan(app: FastAPI):
     try:
         await store.connect()
         logger.info("Gateway lifespan: Redis connected at %s", redis_url)
+        if store.redis is not None:
+            policy_engine.set_redis(store.redis)
+            quota_manager.set_redis(store.redis)
+            await policy_engine.start_pubsub_listener()
     except CacheError as err:
         logger.warning("Gateway lifespan: Redis unavailable — caching disabled (fail-open mode): %s", err)
         store = None  # type: ignore[assignment]
@@ -239,7 +245,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Cleanup: close Redis on shutdown
+    # Cleanup: stop policy engine listener and close Redis on shutdown
+    await policy_engine.stop()
     if store is not None:
         await store.close()
 
@@ -267,6 +274,25 @@ if allowed_origins:
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
+
+class MCPAppProxy:
+    """Proxy ASGI handler that lazily resolves the MCP server's SSE application."""
+
+    def __init__(self):
+        self._app = None
+
+    async def __call__(self, scope, receive, send):
+        global gateway_service
+        if self._app is None and gateway_service is not None:
+            self._app = gateway_service.mcp_server.sse_app()
+        if self._app is not None:
+            await self._app(scope, receive, send)
+        else:
+            response = Response("Gateway MCP server not ready", status_code=503)
+            await response(scope, receive, send)
+
+# Mount official MCP protocol endpoint (SSE transport)
+app.mount("/mcp", MCPAppProxy())
 
 
 # ── Public Endpoints ──────────────────────────────────────────────────────────
@@ -334,10 +360,20 @@ async def call_tool(
     Applies schema validation, explicit cache policy, singleflight deduplication,
     and multi-tenant scope isolation based on the authenticated tenant.
     """
+    tenant_id = auth.tenant_id or "default"
+    policy = await policy_engine.get_effective_policy(tenant_id)
+    allowed, retry_after = await quota_manager.check_rate_limit(tenant_id, policy)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded for tenant '{tenant_id}'. Please retry in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     result = await gateway_service.mcp_server.call_tool(
         req.tool,
         req.arguments or {},
-        scope=auth.tenant_id,
+        scope=tenant_id,
     )
     contents = []
     for c in result.content:
@@ -348,7 +384,7 @@ async def call_tool(
     return {
         "is_error": result.is_error,
         "content": contents,
-        "tenant_id": auth.tenant_id,
+        "tenant_id": tenant_id,
     }
 
 
@@ -433,8 +469,26 @@ async def invalidate_tag_cache(
 if __name__ == "__main__":
     if "--stdio" in sys.argv:
         import asyncio
-        asyncio.run(initialize_default_mocks())
-        gateway_service.mcp_server.run(transport="stdio")
+
+        async def run_stdio_gateway():
+            global gateway_service
+            redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+            store = RedisCacheStore(redis_url=redis_url)
+            try:
+                await store.connect()
+                logger.info("Gateway stdio: Redis connected at %s", redis_url)
+            except Exception as err:
+                logger.warning("Gateway stdio: Redis unavailable — caching disabled: %s", err)
+                store = None
+            gateway_service = GatewayService(cache_store=store)
+            await initialize_default_mocks()
+            try:
+                await gateway_service.mcp_server.run_stdio_async()
+            finally:
+                if store is not None:
+                    await store.close()
+
+        asyncio.run(run_stdio_gateway())
     else:
         import uvicorn
         uvicorn.run("gateway.main:app", host="0.0.0.0", port=8000, reload=False)

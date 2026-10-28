@@ -53,6 +53,8 @@ from gateway.cache_policy import CachePolicyRegistry, CachePolicy
 from gateway.cache_store import RedisCacheStore, CacheError
 from gateway.cache_key import build_cache_key
 from gateway.singleflight import Singleflight
+from gateway.policy_engine import PolicyEngine, policy_engine as default_policy_engine
+from gateway.quota_manager import DistributedQuotaManager, quota_manager as default_quota_manager
 import gateway.cache_metrics as metrics
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,8 @@ class GatewayRouter:
         cache_store: Optional[RedisCacheStore] = None,
         singleflight: Optional[Singleflight] = None,
         upstream_timeout: float = UPSTREAM_TIMEOUT_SECONDS,
+        policy_engine: Optional[PolicyEngine] = None,
+        quota_manager: Optional[DistributedQuotaManager] = None,
     ) -> None:
         self.registry = registry
         self.policy_registry: CachePolicyRegistry = (
@@ -104,6 +108,8 @@ class GatewayRouter:
         self.cache_store: Optional[RedisCacheStore] = cache_store
         self.sf: Singleflight = singleflight or Singleflight()
         self.upstream_timeout = upstream_timeout
+        self.policy_engine: PolicyEngine = policy_engine or default_policy_engine
+        self.quota_manager: DistributedQuotaManager = quota_manager or default_quota_manager
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
@@ -120,8 +126,37 @@ class GatewayRouter:
         `scope` is the authorization scope identifier (opaque; never a raw secret).
         """
         arguments = arguments or {}
+        tenant_id = scope if (scope and scope != "none") else "default"
 
-        # ── Step 1: Tool registry lookup ──────────────────────────────────────
+        # ── Step 0: Dynamic Tenant Policy Access Control (Phase 6) ────────────
+        effective_tenant_policy = await self.policy_engine.get_effective_policy(tenant_id)
+        is_allowed, denial_reason = self.policy_engine.check_tool_access(
+            effective_tenant_policy, namespaced_name
+        )
+        if not is_allowed:
+            return make_error_result(
+                error_type="policy_denied",
+                detail=denial_reason,
+                extra={"tenant_id": tenant_id, "tool": namespaced_name},
+            )
+
+        # ── Step 0.1: Input Payload Size Limit (Phase 6) ───────────────────────
+        try:
+            serialized_args = json.dumps(arguments)
+            arg_bytes = len(serialized_args.encode("utf-8"))
+        except Exception:
+            arg_bytes = 0
+
+        max_in_bytes = effective_tenant_policy.resource_limits.max_input_payload_bytes
+        if arg_bytes > max_in_bytes:
+            metrics.record_payload_rejection("input")
+            return make_error_result(
+                error_type="payload_too_large",
+                detail=f"Input payload size ({arg_bytes} bytes) exceeds limit of {max_in_bytes} bytes.",
+                extra={"tenant_id": tenant_id, "limit_bytes": max_in_bytes},
+            )
+
+        # ── Step 1: Tool registry lookup ──────────────────────────────────
         tool: Optional[RegisteredTool] = self.registry.get_tool(namespaced_name)
         if not tool:
             return make_error_result(
@@ -130,7 +165,7 @@ class GatewayRouter:
                 extra={"requested_tool": namespaced_name},
             )
 
-        # ── Step 2: Argument schema validation ────────────────────────────────
+        # ── Step 2: Argument schema validation ────────────────────────────
         if tool.input_schema and isinstance(tool.input_schema, dict):
             try:
                 jsonschema.validate(instance=arguments, schema=tool.input_schema)
@@ -150,7 +185,7 @@ class GatewayRouter:
                     detail=f"Schema validation error: {str(schema_err)}",
                 )
 
-        # ── Step 3: Server lookup ─────────────────────────────────────────────
+        # ── Step 3: Server lookup ─────────────────────────────────────────
         server: Optional[ServerConfig] = self.registry.get_server(tool.server_name)
         if not server:
             return make_error_result(
@@ -159,26 +194,44 @@ class GatewayRouter:
                 extra={"server": tool.server_name},
             )
 
-        # ── Step 4: Cache policy check ────────────────────────────────────────
+        # ── Step 4: Cache policy check ────────────────────────────────────
+        dyn_eligible, dyn_ttl, _ = self.policy_engine.is_cache_eligible(
+            effective_tenant_policy, namespaced_name
+        )
         policy: CachePolicy = self.policy_registry.get(namespaced_name)
         cache_eligible = (
-            policy.enabled
+            dyn_eligible
+            and policy.enabled
             and policy.read_only
             and self.cache_store is not None
         )
 
-        if not cache_eligible:
-            # Not cacheable — pure passthrough (same as Phase 1).
-            return await self._dispatch_with_timeout(server, tool.original_name, arguments, namespaced_name)
+        ttl_seconds = dyn_ttl if dyn_ttl else policy.ttl_seconds
+        max_response_bytes = min(
+            effective_tenant_policy.cache_rules.max_response_bytes,
+            policy.max_response_bytes,
+        )
 
-        # ── Steps 5–11: Cache-aware path ──────────────────────────────────────
+        if not cache_eligible:
+            # Not cacheable — pure passthrough to upstream with concurrency bounds
+            res = await self._dispatch_with_timeout(
+                server, tool.original_name, arguments, namespaced_name,
+                tenant_id=tenant_id, policy=effective_tenant_policy,
+            )
+            return self._check_output_payload_size(res, effective_tenant_policy, tenant_id)
+
+        # ── Steps 5–11: Cache-aware path ──────────────────────────────────
         try:
-            cache_key = build_cache_key(namespaced_name, arguments, policy, scope)
+            cache_key = build_cache_key(namespaced_name, arguments, policy, tenant_id)
         except TypeError as key_err:
             logger.warning("Cache key build failed for %s: %s", namespaced_name, key_err)
-            return await self._dispatch_with_timeout(server, tool.original_name, arguments, namespaced_name)
+            res = await self._dispatch_with_timeout(
+                server, tool.original_name, arguments, namespaced_name,
+                tenant_id=tenant_id, policy=effective_tenant_policy,
+            )
+            return self._check_output_payload_size(res, effective_tenant_policy, tenant_id)
 
-        # ── Step 5: Initial cache lookup ──────────────────────────────────────
+        # ── Step 5: Initial cache lookup ──────────────────────────────────
         try:
             with metrics.measure_cache_lookup(namespaced_name):
                 cached = await self.cache_store.get(cache_key)
@@ -192,10 +245,13 @@ class GatewayRouter:
                 "Cache read error for %s (failing open to upstream): %s",
                 namespaced_name, cache_err,
             )
-            # Fall through to upstream without caching.
-            return await self._dispatch_with_timeout(server, tool.original_name, arguments, namespaced_name)
+            res = await self._dispatch_with_timeout(
+                server, tool.original_name, arguments, namespaced_name,
+                tenant_id=tenant_id, policy=effective_tenant_policy,
+            )
+            return self._check_output_payload_size(res, effective_tenant_policy, tenant_id)
 
-        # ── Steps 6–11: Singleflight + upstream ───────────────────────────────
+        # ── Steps 6–11: Singleflight + upstream ───────────────────────────
         is_leader = not self.sf.is_in_flight(cache_key)
         if is_leader:
             metrics.record_singleflight_leader(namespaced_name)
@@ -203,8 +259,7 @@ class GatewayRouter:
             metrics.record_singleflight_waiter(namespaced_name)
 
         async def _execute() -> CallToolResult:
-            # Step 7: Double-check cache inside the singleflight to prevent
-            # duplicate upstream calls when two leaders are selected simultaneously.
+            # Step 7: Double-check cache inside singleflight
             try:
                 with metrics.measure_cache_lookup(namespaced_name):
                     cached_inner = await self.cache_store.get(cache_key)
@@ -212,40 +267,43 @@ class GatewayRouter:
                     metrics.record_hit(namespaced_name)
                     return cached_inner
             except CacheError:
-                # Tolerate — proceed to upstream.
                 pass
 
-            # Step 8: Execute upstream.
+            # Step 8: Execute upstream
             with metrics.measure_upstream(namespaced_name):
                 result = await self._dispatch_with_timeout(
-                    server, tool.original_name, arguments, namespaced_name
+                    server, tool.original_name, arguments, namespaced_name,
+                    tenant_id=tenant_id, policy=effective_tenant_policy,
                 )
 
-            # Step 9: Validate before caching (no errors, no malformed).
-            if result.is_error:
+            # Validate output payload size
+            checked_result = self._check_output_payload_size(result, effective_tenant_policy, tenant_id)
+            if checked_result.is_error:
+                if checked_result != result:
+                    return checked_result
                 metrics.record_upstream_failure(namespaced_name)
                 return result
 
-            # Step 10: Cache the successful eligible result.
+            # Step 10: Cache the successful eligible result
             try:
                 try:
                     wrote = await self.cache_store.set(
                         cache_key,
-                        result,
-                        ttl_seconds=policy.ttl_seconds,
+                        checked_result,
+                        ttl_seconds=ttl_seconds,
                         tool_name=namespaced_name,
                         tags=policy.invalidation_tags,
-                        max_bytes=policy.max_response_bytes,
-                        scope=scope,
+                        max_bytes=max_response_bytes,
+                        scope=tenant_id,
                     )
                 except TypeError:
                     wrote = await self.cache_store.set(
                         cache_key,
-                        result,
-                        ttl_seconds=policy.ttl_seconds,
+                        checked_result,
+                        ttl_seconds=ttl_seconds,
                         tool_name=namespaced_name,
                         tags=policy.invalidation_tags,
-                        max_bytes=policy.max_response_bytes,
+                        max_bytes=max_response_bytes,
                     )
                 if wrote:
                     metrics.record_write(namespaced_name)
@@ -258,20 +316,34 @@ class GatewayRouter:
                     namespaced_name, write_err,
                 )
 
-            # Step 11: Return result.
-            return result
+            return checked_result
 
         try:
             result, _ = await self.sf.do(cache_key, _execute)
             return result
         except Exception as exc:
-            # Singleflight propagates leader exception to all waiters.
             logger.exception("Singleflight execution failed for %s", namespaced_name)
             return make_error_result(
                 error_type="upstream_execution_failed",
                 detail=str(exc),
                 extra={"server": server.name, "tool": tool.original_name},
             )
+
+    def _check_output_payload_size(
+        self, result: CallToolResult, policy: Any, tenant_id: str
+    ) -> CallToolResult:
+        """Enforce maximum output payload size limits."""
+        max_out = policy.resource_limits.max_output_payload_bytes
+        for item in result.content:
+            if isinstance(item, TextContent):
+                if len(item.text.encode("utf-8")) > max_out:
+                    metrics.record_payload_rejection("output")
+                    return make_error_result(
+                        error_type="payload_too_large",
+                        detail=f"Upstream response ({len(item.text.encode('utf-8'))} bytes) exceeds limit of {max_out} bytes.",
+                        extra={"tenant_id": tenant_id, "limit_bytes": max_out},
+                    )
+        return result
 
     # ──────────────────────────────────────────────────────────────────────────
     # Upstream dispatch helpers
@@ -283,8 +355,26 @@ class GatewayRouter:
         original_tool_name: str,
         arguments: Dict[str, Any],
         namespaced_name: str,
+        tenant_id: str = "default",
+        policy: Optional[Any] = None,
     ) -> CallToolResult:
-        """Dispatch with a configurable timeout. Returns a structured error on timeout."""
+        """Dispatch with a configurable timeout and concurrency permit acquisition."""
+        permit_id: Optional[str] = None
+        if policy is not None:
+            permit_acquired, permit_id, retry_after = await self.quota_manager.acquire_concurrency_permit(
+                tenant_id, policy
+            )
+            if not permit_acquired:
+                return make_error_result(
+                    error_type="concurrency_limit_exceeded",
+                    detail=(
+                        f"Tenant '{tenant_id}' reached concurrent upstream limit "
+                        f"({policy.resource_limits.max_concurrent_upstream}). "
+                        f"Retry in {retry_after}s."
+                    ),
+                    extra={"tenant_id": tenant_id, "retry_after": retry_after},
+                )
+
         try:
             return await asyncio.wait_for(
                 self._dispatch(server, original_tool_name, arguments),
@@ -306,6 +396,9 @@ class GatewayRouter:
                 detail=str(exc),
                 extra={"server": server.name, "tool": original_tool_name},
             )
+        finally:
+            if permit_id:
+                await self.quota_manager.release_concurrency_permit(tenant_id, permit_id)
 
     async def _dispatch(
         self,
