@@ -13,6 +13,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
+      '/gateway': {
+        target: process.env.VITE_GATEWAY_URL || 'http://gateway:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/gateway/, ''),
+      },
     },
   },
 });

@@ -35,6 +35,7 @@ from gateway.server_validator import validate_server_config, redact_sensitive_co
 from runtime.resume_policy import assess_workflow_resumability
 from storage.database import db
 from storage.events import event_hub
+from storage.migrations.runner import run_migrations
 from storage.models.entities import (
     AuditEvent,
     CacheRules,
@@ -265,6 +266,11 @@ def require_admin(auth: AuthContext = Depends(get_auth_context)) -> AuthContext:
 async def lifespan(app: FastAPI):
     validate_production_security_config()
     await db.connect()
+    # Ensure database migrations are automatically applied on startup
+    try:
+        await run_migrations(db)
+    except Exception as err:
+        logger.warning("Startup database migration check error: %s", err)
     # Perform crash recovery of stranded running workflows
     try:
         recovered = await repository.recover_interrupted_workflows()

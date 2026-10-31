@@ -117,6 +117,7 @@ MIGRATIONS = [
         """
         -- Ensure all columns and constraints match expected Phase 4 types
         ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+        ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS request_prompt TEXT;
         """
     ),
     (

@@ -174,6 +174,19 @@ async def initialize_default_mocks():
             )
         )
 
+    # Register default dev cache policies for immediate demonstration
+    gateway_service.policy_registry.register(
+        CachePolicy(
+            tool_name="repo_metadata__get_repo_info",
+            enabled=True,
+            read_only=True,
+            ttl_seconds=300,
+            policy_version="v1",
+            max_response_bytes=524288,
+            invalidation_tags=frozenset(["repo"]),
+        )
+    )
+
 
 async def load_production_upstream_servers():
     """
