@@ -1,0 +1,101 @@
+name: MCP SmartCache CI & Security Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-and-security:
+    name: Backend Tests & Security Regression
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mcp_user
+          POSTGRES_PASSWORD: mcp_test_password_12345
+          POSTGRES_DB: mcp_smartcache
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_test_password_12345@localhost:5432/mcp_smartcache
+        run: |
+          python -m storage.migrations.runner
+
+      - name: Run Test Suite & Adversarial Security Regressions
+        env:
+          DATABASE_URL: postgresql+asyncpg://mcp_user:mcp_test_password_12345@localhost:5432/mcp_smartcache
+          REDIS_URL: redis://localhost:6379/0
+          ENVIRONMENT: test
+          ENABLE_DEV_MOCKS: "true"
+          AUTH_ENABLED: "true"
+          GATEWAY_ADMIN_API_KEY: dev-admin-secret-key-32chars-long
+          GATEWAY_CLIENT_API_KEY: dev-client-secret-key-32chars-long
+        run: |
+          python -m pytest -v --tb=short
+
+      - name: Validate Environment Template Syntax
+        run: |
+          python scripts/validate_production_config.py --template .env.example
+
+      - name: Validate Production Compose Configuration
+        run: |
+          docker compose -f docker-compose.prod.yml config
+
+  frontend-build:
+    name: Frontend Typecheck & Production Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: dashboard/package.json
+
+      - name: Install Frontend Dependencies
+        working-directory: dashboard
+        run: npm install
+
+      - name: TypeScript Validation and Vite Build
+        working-directory: dashboard
+        run: npm run build
+

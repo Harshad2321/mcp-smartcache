@@ -40,6 +40,7 @@ from gateway.auth import (
     require_client,
     validate_production_security_config,
 )
+from gateway.ingress_middleware import TrustedProxyHostMiddleware
 from mocks.repo_metadata import MockRepoMetadataServer
 from mocks.issues import MockIssuesServer
 
@@ -259,6 +260,9 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+# Apply ingress trusted proxy and host validation guard
+app.add_middleware(TrustedProxyHostMiddleware)
 
 # Apply content length guard
 app.add_middleware(ContentLengthLimitMiddleware)

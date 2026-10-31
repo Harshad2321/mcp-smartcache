@@ -1,8 +1,9 @@
 """
-Phase 6: Distributed Quotas and Backpressure Manager.
+Phase 6 & 7: Distributed Quotas, Backpressure & Failure Resilience Manager.
 Coordinates multi-replica rate limiting and concurrency limits via Redis.
 Guarantees clean permit leases with automatic TTL expiry, atomic Lua release,
-and explicit graceful failure policies.
+explicit graceful failure policies (fail-closed vs degrade-local),
+and isolated permit release namespaces.
 """
 
 import asyncio
@@ -48,6 +49,11 @@ return redis.call('ZREM', key, permit_id)
 """
 
 
+def get_redis_failure_policy() -> str:
+    """Return configured Redis outage behavior: 'fail_closed' or 'degrade_local'."""
+    return os.environ.get("QUOTA_REDIS_FAILURE_POLICY", "degrade_local").lower()
+
+
 class DistributedQuotaManager:
     """
     Manages tenant quotas (rate limits and concurrency) across multiple gateway replicas.
@@ -84,7 +90,6 @@ class DistributedQuotaManager:
         if self.redis:
             rate_key = f"mcp-sc:rate:{tenant_id}:{minute_epoch}"
             try:
-                # Pipeline INCR and EXPIRE for consistency
                 pipe = self.redis.pipeline()
                 pipe.incr(rate_key)
                 pipe.expire(rate_key, 120)
@@ -96,9 +101,12 @@ class DistributedQuotaManager:
                     return False, max(1, seconds_remaining)
                 return True, 0
             except Exception as e:
-                logger.warning("Redis rate limit check failed for %s, falling back to local: %s", tenant_id, e)
+                logger.warning("Redis rate limit check failed for %s: %s", tenant_id, e)
+                if get_redis_failure_policy() == "fail_closed":
+                    record_quota_rejection("rate_limit_redis_outage")
+                    return False, 5
 
-        # Local in-memory fallback if Redis is unavailable
+        # Local in-memory fallback if Redis is unavailable or policy allows degradation
         async with self._local_lock:
             stored_epoch, count = self._local_rate.get(tenant_id, (minute_epoch, 0))
             if stored_epoch != minute_epoch:
@@ -120,10 +128,10 @@ class DistributedQuotaManager:
         Returns (acquired: bool, permit_id: Optional[str], retry_after_seconds: int).
         """
         max_concurrent = policy.resource_limits.max_concurrent_upstream
-        permit_id = f"prm_{uuid.uuid4().hex[:16]}"
         now = time.time()
 
         if self.redis:
+            permit_id = f"prm_redis_{uuid.uuid4().hex[:16]}"
             key = f"mcp-sc:concurrency:{tenant_id}"
             try:
                 if not self._acquire_script:
@@ -140,8 +148,12 @@ class DistributedQuotaManager:
                     return False, None, 2
             except Exception as e:
                 logger.warning("Redis concurrency permit acquisition failed for %s: %s", tenant_id, e)
+                if get_redis_failure_policy() == "fail_closed":
+                    record_quota_rejection("concurrency_redis_outage")
+                    return False, None, 5
 
-        # Local fallback if Redis is down: bounded local concurrency
+        # Local fallback if Redis is down or not configured
+        permit_id = f"prm_local_{uuid.uuid4().hex[:16]}"
         async with self._local_lock:
             active = self._local_concurrency.get(tenant_id, 0)
             if active < max_concurrent:
@@ -153,22 +165,43 @@ class DistributedQuotaManager:
 
     async def release_concurrency_permit(self, tenant_id: str, permit_id: Optional[str]) -> bool:
         """
-        Release a previously acquired concurrency permit.
+        Release a previously acquired concurrency permit in its designated store.
         """
         if not permit_id:
             return False
 
+        if permit_id.startswith("prm_redis_"):
+            if self.redis:
+                key = f"mcp-sc:concurrency:{tenant_id}"
+                try:
+                    if not self._release_script:
+                        self._release_script = self.redis.register_script(RELEASE_CONCURRENCY_LUA)
+                    res = await self._release_script(keys=[key], args=[permit_id])
+                    return bool(res)
+                except Exception as e:
+                    logger.warning("Redis concurrency permit release failed for %s (%s): %s", tenant_id, permit_id, e)
+                    return False
+            return False
+
+        if permit_id.startswith("prm_local_"):
+            async with self._local_lock:
+                active = self._local_concurrency.get(tenant_id, 0)
+                if active > 0:
+                    self._local_concurrency[tenant_id] = active - 1
+                return True
+
+        # Backward compatibility for un-prefixed permits
         if self.redis:
             key = f"mcp-sc:concurrency:{tenant_id}"
             try:
                 if not self._release_script:
                     self._release_script = self.redis.register_script(RELEASE_CONCURRENCY_LUA)
                 res = await self._release_script(keys=[key], args=[permit_id])
-                return bool(res)
+                if bool(res):
+                    return True
             except Exception as e:
                 logger.warning("Redis concurrency permit release failed for %s (%s): %s", tenant_id, permit_id, e)
 
-        # Local fallback release
         async with self._local_lock:
             active = self._local_concurrency.get(tenant_id, 0)
             if active > 0:

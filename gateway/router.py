@@ -47,6 +47,9 @@ import jsonschema
 from mcp.types import CallToolResult, TextContent
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.sse import sse_client
+
+from gateway.outbound_transport import create_safe_mcp_http_client, SSRFSecurityViolation
 
 from gateway.registry import ServerRegistry, RegisteredTool, ServerConfig
 from gateway.cache_policy import CachePolicyRegistry, CachePolicy
@@ -449,6 +452,37 @@ class GatewayRouter:
                 return make_error_result(
                     error_type="upstream_error",
                     detail=f"Error during stdio execution: {str(exc)}",
+                    extra={"server": server.name, "tool": original_tool_name},
+                )
+
+        elif server.transport == "sse":
+            url = server.connection_config.get("url")
+            headers = server.connection_config.get("headers", {})
+            timeout = float(server.connection_config.get("timeout", 15.0))
+            try:
+                async with sse_client(
+                    url,
+                    headers=headers,
+                    httpx_client_factory=create_safe_mcp_http_client,
+                ) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await asyncio.wait_for(session.initialize(), timeout=timeout)
+                        raw_result = await asyncio.wait_for(
+                            session.call_tool(original_tool_name, arguments),
+                            timeout=timeout,
+                        )
+                        return self._validate_and_normalize_result(raw_result, server.name)
+            except SSRFSecurityViolation as ssrf_err:
+                logger.warning("SSRF violation blocked during upstream SSE call: %s", ssrf_err)
+                return make_error_result(
+                    error_type="upstream_ssrf_blocked",
+                    detail=f"Outbound connection blocked by security policy: {ssrf_err}",
+                    extra={"server": server.name, "tool": original_tool_name},
+                )
+            except (ConnectionError, Exception) as exc:
+                return make_error_result(
+                    error_type="upstream_error",
+                    detail=f"Error during SSE tool execution: {str(exc)}",
                     extra={"server": server.name, "tool": original_tool_name},
                 )
 

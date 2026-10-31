@@ -26,6 +26,8 @@ from typing import Dict, FrozenSet, Optional, Tuple
 from fastapi import Header, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from gateway.oidc import OIDCAuthValidator, OIDCValidationError, is_jwt_token
+
 logger = logging.getLogger(__name__)
 
 # Pattern for safe tenant IDs: alphanumeric, underscores, hyphens, dots; 1-64 chars.
@@ -42,6 +44,22 @@ KNOWN_DEV_SECRETS = {
 }
 
 security_bearer = HTTPBearer(auto_error=False)
+
+_oidc_validator: Optional[OIDCAuthValidator] = None
+
+
+def get_oidc_validator() -> OIDCAuthValidator:
+    """Return or initialize global OIDCAuthValidator."""
+    global _oidc_validator
+    if _oidc_validator is None:
+        _oidc_validator = OIDCAuthValidator()
+    return _oidc_validator
+
+
+def set_oidc_validator(validator: Optional[OIDCAuthValidator]) -> None:
+    """Set or override global OIDCAuthValidator (e.g. for testing)."""
+    global _oidc_validator
+    _oidc_validator = validator
 
 
 class Role(str, Enum):
@@ -145,6 +163,18 @@ def validate_production_security_config() -> None:
                     "CRITICAL SECURITY CONFIGURATION ERROR: Development client keys cannot be used in production mode."
                 )
 
+        if tenant_map:
+            for mapped_k in tenant_map.keys():
+                if len(mapped_k) < 16:
+                    raise RuntimeError(
+                        "CRITICAL SECURITY CONFIGURATION ERROR: In production, all CLIENT_TENANT_KEYS "
+                        "must be configured with at least 16 characters."
+                    )
+                if mapped_k in KNOWN_DEV_SECRETS or mapped_k.startswith("dev-") or mapped_k.startswith("test-"):
+                    raise RuntimeError(
+                        "CRITICAL SECURITY CONFIGURATION ERROR: Development client keys in CLIENT_TENANT_KEYS cannot be used in production mode."
+                    )
+
 
 def extract_raw_token(
     bearer: Optional[HTTPAuthorizationCredentials] = None,
@@ -173,7 +203,35 @@ def authenticate_credentials(token: Optional[str]) -> Tuple[Role, str, FrozenSet
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 1. Check Master Admin Key
+    # Production Safety: Explicitly block any dev/test credentials from authenticating in production mode
+    env = get_environment()
+    if env == "production":
+        if token in KNOWN_DEV_SECRETS or token.startswith("dev-") or token.startswith("test-"):
+            logger.warning("REJECTED: Development token rejected in production environment.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Development credentials are strictly rejected in production mode.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    # 1. Check if token is an OIDC / OAuth2 JWT
+    if is_jwt_token(token):
+        val = get_oidc_validator()
+        try:
+            ident = val.validate_token(token)
+            role = Role.ADMIN if ident.is_admin else Role.CLIENT
+            key_id = f"oidc:{ident.subject}"
+            authorized_tenants = frozenset(["*"]) if ident.is_admin else frozenset([ident.tenant_id])
+            return role, key_id, authorized_tenants
+        except OIDCValidationError as err:
+            logger.warning("OIDC authentication failed: %s", err)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid OIDC authentication token: {err}",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    # 2. Check Master Admin Key
     admin_key = get_admin_api_key()
     if admin_key and secrets.compare_digest(token, admin_key):
         return Role.ADMIN, "admin", frozenset(["*"])

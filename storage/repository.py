@@ -313,60 +313,86 @@ class StorageRepository:
         summary: Optional[Dict[str, Any]] = None,
         duration_ms: Optional[int] = None,
         tenant_id: Optional[str] = None,
+        expected_status: Optional[Any] = None,
     ) -> Optional[WorkflowRun]:
         """
-        Transition workflow to new status with validation against ALLOWED_WORKFLOW_TRANSITIONS.
+        Transition workflow to new status with atomic database row-level locking (FOR UPDATE)
+        and validation against ALLOWED_WORKFLOW_TRANSITIONS. Prevents race conditions.
+        If expected_status is provided, verifies that current status matches before transitioning.
         """
-        current = await self.get_workflow(workflow_id, tenant_id=tenant_id)
-        if not current:
-            return None
+        async with self.db.transaction() as conn:
+            if tenant_id:
+                curr_row = await conn.fetchrow(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = $1 AND tenant_id = $2 FOR UPDATE",
+                    workflow_id,
+                    tenant_id,
+                )
+            else:
+                curr_row = await conn.fetchrow(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = $1 FOR UPDATE",
+                    workflow_id,
+                )
+            if not curr_row:
+                return None
+            current = self._row_to_workflow(curr_row)
 
-        allowed = ALLOWED_WORKFLOW_TRANSITIONS.get(current.status, set())
-        if new_status not in allowed and new_status != current.status:
-            raise ValueError(
-                f"Invalid workflow status transition: '{current.status}' -> '{new_status}'"
+            if expected_status is not None:
+                expected_set = (
+                    expected_status
+                    if isinstance(expected_status, (set, list, tuple, frozenset))
+                    else {expected_status}
+                )
+                if current.status not in expected_set:
+                    raise ValueError(
+                        f"Workflow '{workflow_id}' status is '{current.status.value}', expected one of {[s.value if hasattr(s, 'value') else str(s) for s in expected_set]}"
+                    )
+
+            allowed = ALLOWED_WORKFLOW_TRANSITIONS.get(current.status, set())
+            if new_status not in allowed and new_status != current.status:
+                raise ValueError(
+                    f"Invalid workflow status transition: '{current.status.value}' -> '{new_status.value if isinstance(new_status, WorkflowStatus) else new_status}'"
+                )
+
+            now = utc_now()
+            effective_started_at = started_at or current.started_at
+            if new_status == WorkflowStatus.RUNNING and not effective_started_at:
+                effective_started_at = now
+
+            effective_completed_at = completed_at or current.completed_at
+            if new_status in {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED, WorkflowStatus.INTERRUPTED} and not effective_completed_at:
+                effective_completed_at = now
+
+            cleaned_summary = bound_json_payload(summary) if summary else current.summary
+            cleaned_error = error or current.error
+            cleaned_answer = final_answer or current.final_answer
+
+            row = await conn.fetchrow(
+                """
+                UPDATE workflow_runs
+                SET status = $2,
+                    started_at = $3,
+                    completed_at = $4,
+                    duration_ms = $5,
+                    error = $6,
+                    final_answer = $7,
+                    summary = $8,
+                    updated_at = $9
+                WHERE workflow_id = $1
+                RETURNING *
+                """,
+                workflow_id,
+                new_status.value if isinstance(new_status, WorkflowStatus) else str(new_status),
+                effective_started_at,
+                effective_completed_at,
+                duration_ms or current.duration_ms,
+                cleaned_error,
+                cleaned_answer,
+                cleaned_summary,
+                now,
             )
-
-        now = utc_now()
-        effective_started_at = started_at or current.started_at
-        if new_status == WorkflowStatus.RUNNING and not effective_started_at:
-            effective_started_at = now
-
-        effective_completed_at = completed_at or current.completed_at
-        if new_status in {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED, WorkflowStatus.INTERRUPTED} and not effective_completed_at:
-            effective_completed_at = now
-
-        cleaned_summary = bound_json_payload(summary) if summary else current.summary
-        cleaned_error = error or current.error
-        cleaned_answer = final_answer or current.final_answer
-
-        row = await self.db.fetchrow(
-            """
-            UPDATE workflow_runs
-            SET status = $2,
-                started_at = $3,
-                completed_at = $4,
-                duration_ms = $5,
-                error = $6,
-                final_answer = $7,
-                summary = $8,
-                updated_at = $9
-            WHERE workflow_id = $1
-            RETURNING *
-            """,
-            workflow_id,
-            new_status.value if isinstance(new_status, WorkflowStatus) else str(new_status),
-            effective_started_at,
-            effective_completed_at,
-            duration_ms or current.duration_ms,
-            cleaned_error,
-            cleaned_answer,
-            cleaned_summary,
-            now,
-        )
-        if not row:
-            return None
-        return self._row_to_workflow(row)
+            if not row:
+                return None
+            return self._row_to_workflow(row)
 
     async def cancel_workflow(
         self,
@@ -530,6 +556,35 @@ class StorageRepository:
             res,
             err,
             attempt_count,
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    async def claim_task(
+        self,
+        workflow_id: str,
+        task_id: str,
+        worker_id: Optional[str] = None,
+    ) -> Optional[WorkflowTask]:
+        """
+        Atomically claim a pending task for exclusive execution by a worker.
+        Uses conditional UPDATE on status='pending'. If two workers race to claim
+        the same task, exactly one worker receives the updated record; the other gets None.
+        """
+        now = utc_now()
+        row = await self.db.fetchrow(
+            """
+            UPDATE workflow_tasks
+            SET status = 'running',
+                started_at = $3,
+                attempt_count = attempt_count + 1
+            WHERE workflow_id = $1 AND task_id = $2 AND status = 'pending'
+            RETURNING *
+            """,
+            workflow_id,
+            task_id,
+            now,
         )
         if not row:
             return None
@@ -799,9 +854,9 @@ class StorageRepository:
         return self._row_to_server(row)
 
     async def list_servers(self, limit: int = 50, offset: int = 0) -> List[UpstreamServer]:
-        """List registered upstream servers ordered by created_at."""
+        """List registered upstream servers ordered by created_at DESC (newest first)."""
         rows = await self.db.fetch(
-            "SELECT * FROM upstream_servers ORDER BY created_at ASC LIMIT $1 OFFSET $2;",
+            "SELECT * FROM upstream_servers ORDER BY created_at DESC LIMIT $1 OFFSET $2;",
             limit,
             offset,
         )

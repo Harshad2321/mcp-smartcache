@@ -657,10 +657,214 @@ Phase 5 extends MCP SmartCache with three production-grade distributed infrastru
 
 ---
 
+## Phase 6: Dynamic Tenant Policy Governance, Distributed Quotas & Human-in-the-Loop Operations
+
+Phase 6 completes the production-grade governance and operational resiliency layer of MCP SmartCache:
+
+### 1. Dynamic Tenant Policy Governance (Feature A)
+- **Versioned Policy Schema**: Persisted in PostgreSQL (`tenant_policies`) with optimistic versioning (`policy_version`), tenant isolation foreign keys, and active state tracking (`is_active`).
+- **Comprehensive Governance Model**:
+  - **Tool Rules**: Configurable allowed and denied patterns (`fnmatch` syntax), verified read-only tool classifications, and optional default-deny mode. Substring heuristics (e.g. `get_` or `read_`) are strictly rejected as proof of read-only safety.
+  - **Cache Rules**: Per-tenant caching enable/disable toggle, default TTL (seconds), maximum permitted TTL cap, per-tool custom TTL overrides, and response byte caps (`max_response_bytes`).
+  - **Resource Limits**: Concurrency caps (`max_concurrent_upstream`, `max_concurrent_workflows`), task limits (`max_tasks_per_workflow`), execution timeout caps, payload bounds (`max_input_payload_bytes`, `max_output_payload_bytes`), request rate limits (`rate_limit_rpm`), and burst capacity (`burst_limit`).
+- **Strict Validation Pipeline**: Candidate policies are pre-validated via `POST /policies/validate`. Inconsistent configurations (e.g., mutation keywords in read-only patterns, `default_ttl > max_ttl`, or unbounded payload sizes) return actionable validation errors and prevent activation.
+- **Hot Reload via Redis Pub/Sub**: Activating a policy writes to PostgreSQL (source of truth) and publishes an invalidation event to `mcp-sc:policy:events`. Gateway replicas refresh their in-memory caches without process restarts or traffic interruption.
+- **Control API Endpoints**:
+  - `GET /policies`: List tenant policies (tenant-isolated).
+  - `GET /policies/effective/{tenant_id}`: Inspect active effective policy.
+  - `GET /policies/{id}`: Retrieve specific policy version.
+  - `POST /policies/validate`: Dry-run validation of proposed policy rules.
+  - `POST /policies`: Register or update policy version.
+  - `POST /policies/{id}/activate`: Transactionally activate a validated policy version.
+  - `POST /policies/{id}/rollback`: Roll back to a previous valid policy version.
+
+### 2. Runtime Policy Enforcement (Feature B)
+Every incoming request to the MCP Gateway traverses an 11-step enforcement pipeline:
+1. **Authentication & Tenant Binding**: Extracts bearer token and validates against tenant key registry (`CLIENT_TENANT_KEYS`).
+2. **Effective Policy Resolution**: Reads active policy from fast local cache or PostgreSQL with safe fallback defaults.
+3. **Tool Access Evaluation**: Checks explicit denylists and default-deny allowlists. Denied tools are rejected immediately with structured `policy_denied` errors and never dispatched upstream.
+4. **Input Payload Bound Check**: Validates serialized arguments against `max_input_payload_bytes`. Excess sizes return `payload_too_large`.
+5. **Distributed Rate Limiting**: Evaluates rate against minute-window limits via Redis.
+6. **Cache Eligibility Determination**: Validates tenant cache toggle, bypass flags, and explicit read-only status.
+7. **Cache Lookup**: Queries tenant-scoped cache (`mcp-sc:v1:<version>:<tenant>:<digest>`).
+8. **Concurrency Lease Acquisition**: Acquires atomic Redis permit before invoking upstream.
+9. **Bounded Upstream Invocation**: Invokes tool within timeout limits; permit is guaranteed released in a `finally` block.
+10. **Output Payload Bound & Upstream Result Check**: Ensures response does not exceed `max_output_payload_bytes`. Only clean read-only results are stored in cache.
+11. **Audit & Telemetry**: Emits bounded-cardinality Prometheus metrics (`policy_eval_total`, `policy_denials_total`, `quota_rejections_total`, `payload_rejections_total`).
+
+### 3. Distributed Quotas & Backpressure (Feature C)
+- **Shared Rate Limiting**: Multi-replica rate limits are enforced via Redis minute-epoch keys (`mcp-sc:rate:{tenant_id}:{minute_epoch}`) using atomic pipelines. Over-quota callers receive HTTP 429 with standard `Retry-After` headers.
+- **Atomic Concurrency Leases**: Concurrency is coordinated across gateway replicas using Redis Sorted Sets (`mcp-sc:concurrency:{tenant_id}`) and atomic Lua scripts:
+  - `ACQUIRE_CONCURRENCY_LUA`: Purges expired leases (`now - lease_timeout`), tests capacity, and atomically adds lease.
+  - `RELEASE_CONCURRENCY_LUA`: Removes lease using the unique permit ID, preventing stale processes from releasing valid permits.
+- **Auto-Expiring Stale Leases**: Crashed or stalled processes automatically lose their leases after `lease_timeout` (default: 60s), preventing permanent quota leaks.
+- **Degraded Local Fallback**: If Redis becomes unavailable, the system safely falls back to local in-process limits with structured error logging.
+
+### 4. Human-in-the-Loop Workflow Reconciliation (Feature D)
+- **Interrupted Mutation Detection**: When a workflow is interrupted mid-execution, `assess_workflow_resumability()` inspects uncompleted tasks:
+  - Pure read-only tasks are safely re-scheduled.
+  - Side-effecting tasks whose outcome is uncertain are **strictly blocked from automatic replay**.
+  - A durable reconciliation record is created in `workflow_reconciliations`.
+- **Durable Case Record**: Captures `reconciliation_id`, `workflow_id`, `task_id`, `tenant_id`, `checkpoint_id`, `tool_name`, `reason`, `known_outcome`, `status`, `decision_note`, `idempotency_key`, `risk_acknowledged`, `reviewer`, and `decision_timestamp`.
+- **Operator Decision State Machine**: Authorized operators review cases via Control API or Dashboard:
+  - `approve_retry`: Permits re-execution only when either a verified upstream `idempotency_key` is supplied or the operator explicitly checks `risk_acknowledged = True`.
+  - `reject_retry`: Rejects retry; workflow task will not be re-executed.
+  - `acknowledge_success`: Marks task as verified successful externally, allowing dependent tasks to resume.
+  - `acknowledge_failure`: Finalizes task as confirmed failure without re-running.
+  - `external_investigation`: Marks case for external review.
+  - `resolve`: Closes finalized case.
+- **Transactional Consistency & Auditing**: Conflicting concurrent operator decisions are rejected via database transactions and status checks. Every decision generates an immutable PostgreSQL audit event.
+
+### 5. Interactive Dashboard Integration (Feature E)
+- **Tenant Policies Tab**:
+  - Live display of effective active policy, tool rules, caching limits, and resource quotas.
+  - Historical policy version table with rollback actions.
+  - Policy editor modal with live JSON validation against platform invariants and one-click atomic activation.
+- **Human-in-the-Loop Reconciliations Tab**:
+  - Operational metrics cards: Total Cases, Pending Review, Approved Retries, and Resolved.
+  - Case table detailing workflow ID, task ID, tool, known outcome, and status.
+  - Interactive "Review & Decide" modal with high-risk warning banners, idempotency key input, and mandatory risk-acknowledgment checkbox for unsafe retries.
+
+### 6. Security Boundaries & Operational Invariants (Feature F)
+- **Tenant Scope Isolation**: All cache keys, singleflight locks, pub/sub channels, policies, and reconciliations are partitioned by authenticated tenant ID.
+- **SSRF & Dangerous Subprocess Protection**: Strict IP parsing blocks private IP blocks and cloud metadata endpoints (`169.254.169.254`). Stdio transports reject shell injection metacharacters.
+- **Bounded Telemetry Cardinality**: Prometheus metrics avoid raw tenant IDs, user keys, or tool arguments in labels, preventing memory leaks in metric scrapers.
+
+---
+
 ### Production Readiness & Known Limitations
 
-- **Identity Provider (IdP)**: Current tenant authentication uses constant-time API key verification and strict tenant binding (`CLIENT_TENANT_KEYS`). Production enterprise deployments should integrate an external OAuth2/OIDC identity provider issuing cryptographically signed JWTs with tenant claims.
-- **SSRF Network Controls**: Application-level IP validation blocks private subnets and cloud metadata services. In high-security multi-tenant deployments, this should be paired with Kubernetes egress network policies or VPC security groups.
-- **At-Least-Once Tool Execution**: For upstream MCP servers without native idempotency token support, tool execution semantics remain at-least-once. Side-effecting operations interrupted mid-flight must be reconciled by human operators.
+- **Identity Provider (IdP)**: Current tenant authentication supports both constant-time API key verification (`CLIENT_TENANT_KEYS`) and enterprise OAuth2/OIDC JWT validation (`OIDCAuthValidator` supporting RS256/ES256/HS256 with key rotation and strict algorithm whitelist).
+- **SSRF Network Controls**: Multi-tier application-level IP validation blocks private subnets, decimal/hex/octal/shortened alternate IP encodings, IPv4-mapped IPv6 addresses, DNS rebinding, and cloud metadata services. In high-security multi-tenant deployments, this is paired with Docker internal network tiers or Kubernetes network policies.
+- **At-Least-Once Tool Execution**: For upstream MCP servers without native idempotency token support, tool execution semantics remain at-least-once. Side-effecting operations interrupted mid-flight must be reconciled by human operators via the reconciliation state machine.
+
+---
+
+## Phase 7: Production Hardening, Security Verification & Release Readiness
+
+Phase 7 completes the production hardening of MCP SmartCache across security boundaries, transport filtering, authentication federation, failure resilience, and deployment architecture.
+
+### 1. SSRF & Outbound Transport Hardening
+- **Flexible IP Address Parser (`parse_flexible_ip`)**: Transparently decodes alternate representations before evaluation:
+  - Decimal integers (e.g. `http://2130706433/` -> `127.0.0.1`)
+  - Hexadecimal IPs (e.g. `http://0x7f000001/` -> `127.0.0.1`)
+  - Dotted octal IPs (e.g. `http://0177.0.0.1/` -> `127.0.0.1`)
+  - Shortened IP formats (e.g. `http://127.1/` -> `127.0.0.1`)
+  - IPv4-mapped IPv6 addresses (e.g. `http://[::ffff:127.0.0.1]/` and `http://[::ffff:169.254.169.254]/`)
+- **Comprehensive Cloud Metadata Blocklist**:
+  - Unconditionally blocks cloud metadata endpoints across all environments: AWS/GCP/Azure (`169.254.169.254`), Alibaba Cloud (`100.100.100.200`), Azure WireServer (`168.63.129.16`), Oracle Cloud (`192.0.0.192`), and GCP metadata (`metadata.google.internal`).
+  - Production blocks loopback, RFC 1918 private subnets, CGNAT (`100.64.0.0/10`), link-local, multicast, reserved, and unspecified addresses.
+- **DNS Rebinding Protection**:
+  - Resolves domain names via `socket.getaddrinfo()` during registration; if any returned address resolves to a forbidden or private address, registration is rejected.
+- **Stdio Transport Subprocess Lockdown**:
+  - Disallows shell interpreters (`sh`, `bash`, `zsh`, `csh`, `cmd.exe`, `powershell.exe`, `pwsh`).
+  - Metacharacter filter strictly rejects `[;&|`$<>()\n\r"'\\]`.
+
+### 2. Enterprise Authentication & OIDC Integration
+- **OAuth2 / OIDC Cryptographic JWT Provider (`gateway/oidc.py`)**:
+  - Supports standard OIDC Bearer tokens with signature verification against configured public keys or dynamic JWKS (`JWKSCache`).
+  - Strict algorithm whitelist (`RS256`, `ES256`, `HS256`). Rejects unsigned tokens or tokens specifying algorithm `none`.
+  - Enforces `iss`, `aud`, `exp`, `nbf`, and `iat` time claims.
+  - Zero-trust tenant claim extraction (`tenant_id`, `tid`, `org_id`) and role mapping (`roles`, `groups`).
+- **Control API & Gateway Hardening**:
+  - All API key and secret checks use constant-time `secrets.compare_digest`.
+  - Restricted CORS origin filtering (`CORS_ALLOWED_ORIGINS`).
+  - Lifespan startup validation (`validate_production_security_config`) enforcing minimum key lengths and rejecting dev placeholders in production.
+  - DoS mitigation via `ContentLengthLimitMiddleware` enforcing strict payload size bounds.
+
+### 3. Workflow Concurrency, Replay & Cancellation Safety
+- **Tenant-Isolated Cancellation**:
+  - Control API exposes `POST /workflows/{id}/cancel` enforcing tenant ownership, rejecting cross-tenant cancellation with HTTP 404, transitioning state to `CANCELLED`, and publishing audit/trace telemetry.
+- **Resumption Race Condition Elimination**:
+  - `POST /workflows/{id}/resume` verifies active workflow status, rejecting resume requests on currently `RUNNING` workflows with HTTP 409 Conflict.
+- **Reconciliation Decision Hardening**:
+  - Strips whitespace on `idempotency_key` and strictly rejects whitespace-only keys when `risk_acknowledged=False`.
+  - Prevents conflicting decisions on finalized reconciliation cases (`RESOLVED` or `REJECTED`) with HTTP 409 Conflict.
+
+### 4. Distributed Quota Fail-Closed Resilience
+- **Configurable Outage Policy**:
+  - Supports `QUOTA_REDIS_FAILURE_POLICY=fail_closed` to strictly reject traffic with HTTP 429 when Redis is unreachable, protecting upstream services against quota overages.
+- **Permit Namespace Separation**:
+  - Distinguishes permits (`prm_redis_` vs `prm_local_`), guaranteeing that releasing a Redis permit during transient connection issues never corrupts local concurrency counts.
+
+### 5. Sensitive Data Redaction & Sanitization
+- **Regex Redaction in String Fields**:
+  - Automatically redacts authorization headers (`Bearer [REDACTED]`) and AWS keys (`[REDACTED_AWS_KEY]`) within log messages, prompt inputs, and trace event details.
+- **Sensitive Key Expansion**:
+  - Deep dictionary recursion redacts `password`, `token`, `secret`, `api_key`, `client_secret`, `admin_key`, `id_token`, `refresh_token`, `cookie`, `session`, `x-api-key`, and private keys.
+
+### 6. Production Deployment Stack (`docker-compose.prod.yml`)
+- **Internal Network Isolation**:
+  - PostgreSQL and Redis containers do not publish host ports; they reside strictly within an isolated `internal-tier` Docker network.
+- **Unprivileged Containers**:
+  - Application services enforce non-root execution (`user: "1000:1000"`) and `no-new-privileges:true`.
+- **Resource Constraints & Log Rotation**:
+  - CPU and memory bounds defined for all containers with JSON-file log rotation.
+
+---
+
+## Phase 8: Independent Security Verification, Reliability Engineering & Production Deployment
+
+Phase 8 independently verifies and hardens the entire MCP SmartCache platform against adversarial threat vectors, concurrency race conditions, and production failure modes.
+
+### 1. Connection-Time SSRF & Kernel Socket Peer Inspection (`gateway/outbound_transport.py`)
+- **Anti-DNS Rebinding (TOCTOU Defense)**:
+  - Validating hostnames at registration time alone is insufficient against DNS rebinding, where a domain returns a public IP during registration and `127.0.0.1` at connection time.
+  - Subclassed `AnyIOBackend.connect_tcp()` in `SafeOutboundNetworkBackend`:
+    - Validates all resolved addresses before dialing.
+    - Inspects the actual connected TCP peer socket (`stream._raw_socket.getpeername()`). If the connected peer IP is a loopback, private, link-local, or cloud metadata address, the connection is instantly aborted with `SSRFSecurityViolation`.
+- **Redirect Interception (`SafeAsyncHTTPTransport`)**:
+  - Automatically intercepts HTTP 3xx responses and validates the target `Location` header before allowing the client to follow redirects.
+- **MCP Client Integration**:
+  - `create_safe_mcp_http_client` is supplied as `httpx_client_factory` across `sse_client` tool discovery and runtime tool invocation.
+
+### 2. JWT Algorithm Confusion Attack Defense (CVE-2015-9235)
+- **Key-Type Separation in `gateway/oidc.py`**:
+  - Prevents an attacker from signing a forged JWT using HMAC (`HS256`) with the server's public RSA/EC key as the HMAC secret.
+  - The validator strictly rejects `HS256` tokens if the configured verification key is an asymmetric public key (PEM string or `PublicKey` instance).
+  - Enforces mandatory `issuer` and `audience` parameters on every validation attempt.
+
+### 3. Non-Disclosing Authorization Boundary
+- Standardized all tenant-facing endpoints (`/workflows/{id}`, `/policies/{id}`, `/policies/{id}/activate`, `/policies/{id}/rollback`, `/reconciliations/{id}`) to return HTTP 404 Not Found when a caller attempts to access another tenant's resource, eliminating resource existence disclosure side-channels.
+
+### 4. Database-Level Atomic Workflow Status Locking
+- Enhanced `StorageRepository.update_workflow_status()` with PostgreSQL row-level locks:
+  ```sql
+  SELECT * FROM workflow_runs WHERE workflow_id = $1 FOR UPDATE
+  ```
+- Guarantees strict serializability during concurrent workflow resumption, cancellation, and worker execution. Prevents parallel requests from overwriting terminal states (`COMPLETED`, `CANCELLED`).
+
+### 5. Multi-Pattern Sensitive Data Redaction (`storage/sanitize.py`)
+- Automatically detects and redacts:
+  - Database connection strings (`postgresql://user:[REDACTED]@host:port/db`, `redis://:[REDACTED]@host:port/db`).
+  - Multiline PEM private keys (`[REDACTED_PRIVATE_KEY]`).
+  - HTTP Basic authorization headers (`Basic [REDACTED]`).
+  - Session and JWT cookies (`session=[REDACTED]`, `jwt=[REDACTED]`).
+
+### 6. Automated Production Verification & CI Pipeline
+- **Continuous Integration (`.github/workflows/ci.yml`)**:
+  - Spins up PostgreSQL 16 and Redis 7 service containers.
+  - Executes database migrations, backend unit tests, and adversarial security suites.
+  - Performs TypeScript type validation (`tsc --noEmit`) and Vite production bundling.
+  - Validates `docker-compose.prod.yml` configuration syntax.
+- **Production Config Validator (`scripts/validate_production_config.py`)**:
+  - Enforces minimum secret lengths, verifies lack of development placeholders, checks CORS origins, and validates Redis failure policies prior to deployment.
+- **Sanitized Environment Template (`.env.example`)**:
+  - Provides a safe template of all required environment variables with non-secret examples.
+
+---
+
+## Phase 9 & 10: Production Release Gate & Deployment Rehearsal
+
+Phase 10 independently verified the entire stack through a live deployment rehearsal, confirming fail-closed outbound SSRF transport, multi-mode configuration validation, multi-worker task claim mutual exclusion, and durability across container restarts.
+
+### Operational Deliverables & Verification
+- **Operational Acceptance Report**: [`docs/release/phase10-operational-acceptance.md`](docs/release/phase10-operational-acceptance.md) (Full test evidence matrix, 258 passing tests, live deployment metrics).
+- **Production Operations Runbook**: [`docs/runbooks/production-operations.md`](docs/runbooks/production-operations.md) (Procedures for deployment, health checks, backup/restore, secret rotation, and incident recovery).
+- **Architectural Decision Record**: [`docs/adr/0010-production-deployment-rehearsal-and-operational-acceptance.md`](docs/adr/0010-production-deployment-rehearsal-and-operational-acceptance.md).
+
+
+
+
 
 

@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -25,7 +26,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from gateway.auth import KNOWN_DEV_SECRETS, get_oidc_validator, validate_production_security_config
+from gateway.ingress_middleware import TrustedProxyHostMiddleware
+from gateway.oidc import OIDCAuthValidator, OIDCValidationError, is_jwt_token
 from gateway.server_validator import validate_server_config, redact_sensitive_config
 from runtime.resume_policy import assess_workflow_resumability
 from storage.database import db
@@ -56,6 +61,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADMIN_KEY = "dev-admin-secret-key-32chars-long"
+DEFAULT_CLIENT_KEY = "dev-client-secret-key-32chars-long"
 
 
 # ── Auth & Context Models ──────────────────────────────────────────────────────
@@ -91,13 +97,52 @@ def parse_client_tenant_keys() -> Dict[str, str]:
     return mapping
 
 
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", 10 * 1024 * 1024))  # 10MB default
+
+
+def get_cors_origins() -> List[str]:
+    """Retrieve allowed CORS origins, forbidding wildcard with credentials in production."""
+    raw = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
+    if not raw:
+        if os.environ.get("ENVIRONMENT", "development").lower() == "production":
+            return []
+        return [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+        ]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
+    """Enforce strict payload size limits to guard against DoS memory exhaustion."""
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                length = int(content_length)
+                if length > MAX_REQUEST_BYTES:
+                    return Response(
+                        content=json.dumps({
+                            "detail": f"Request entity exceeds maximum permitted size of {MAX_REQUEST_BYTES} bytes."
+                        }),
+                        status_code=413,
+                        media_type="application/json",
+                    )
+            except ValueError:
+                pass
+        return await call_next(request)
+
+
 async def get_auth_context(
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID"),
 ) -> AuthContext:
     """Validate Bearer authentication and tenant binding."""
     auth_enabled = os.environ.get("AUTH_ENABLED", "true").lower() in ("true", "1")
-    admin_key = os.environ.get("GATEWAY_ADMIN_API_KEY", DEFAULT_ADMIN_KEY)
+    env = os.environ.get("ENVIRONMENT", "development").lower()
 
     if not auth_enabled:
         return AuthContext(actor="anonymous", is_admin=True, tenant_id=x_tenant_id or "default")
@@ -110,13 +155,72 @@ async def get_auth_context(
 
     token = authorization.split("Bearer ", 1)[1].strip()
 
-    # Check Admin Token
-    if token == admin_key:
+    # Production safety: dev secrets are strictly rejected in production mode
+    if env == "production":
+        if token in KNOWN_DEV_SECRETS or token.startswith("dev-") or token.startswith("test-"):
+            logger.warning("REJECTED: Development token rejected in production environment.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Development credentials are strictly rejected in production mode",
+            )
+        admin_key = os.environ.get("GATEWAY_ADMIN_API_KEY")
+    else:
+        admin_key = os.environ.get("GATEWAY_ADMIN_API_KEY", DEFAULT_ADMIN_KEY)
+
+    # 1. Check if token is an OIDC / OAuth2 JWT
+    if is_jwt_token(token):
+        val = get_oidc_validator()
+        try:
+            ident = val.validate_token(token)
+            if ident.is_admin:
+                return AuthContext(actor=f"oidc:{ident.subject}", is_admin=True, tenant_id=x_tenant_id or "default")
+
+            bound_tenant = ident.tenant_id
+            if x_tenant_id and x_tenant_id != bound_tenant:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Client is not authorized to access tenant '{x_tenant_id}' (token bound to '{bound_tenant}')",
+                )
+            tenant = await repository.get_tenant(bound_tenant)
+            if tenant and not tenant.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Tenant '{bound_tenant}' is disabled",
+                )
+            return AuthContext(
+                actor=f"oidc:{ident.subject}",
+                is_admin=False,
+                tenant_id=bound_tenant,
+                tenant=tenant,
+            )
+        except OIDCValidationError as err:
+            logger.warning("Control API OIDC auth failure: %s", err)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid OIDC authentication token: {err}",
+            )
+
+    # 2. Check Admin Token (constant-time)
+    if admin_key and secrets.compare_digest(token, admin_key):
         return AuthContext(actor="admin", is_admin=True, tenant_id=x_tenant_id)
 
-    # Check Client Tenant Token
+    # 3. Check Client Tenant Token (constant-time)
     tenant_keys = parse_client_tenant_keys()
-    bound_tenant = tenant_keys.get(token)
+    bound_tenant = None
+    for k, v in tenant_keys.items():
+        if secrets.compare_digest(token, k):
+            bound_tenant = v
+            break
+
+    # Check Default Client API Key (constant-time)
+    if not bound_tenant:
+        if env == "production":
+            client_key = os.environ.get("GATEWAY_CLIENT_API_KEY")
+        else:
+            client_key = os.environ.get("GATEWAY_CLIENT_API_KEY", DEFAULT_CLIENT_KEY)
+        if client_key and secrets.compare_digest(token, client_key):
+            bound_tenant = os.environ.get("DEFAULT_CLIENT_TENANT", "default").strip()
+
     if not bound_tenant:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -159,6 +263,7 @@ def require_admin(auth: AuthContext = Depends(get_auth_context)) -> AuthContext:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_production_security_config()
     await db.connect()
     # Perform crash recovery of stranded running workflows
     try:
@@ -178,13 +283,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+cors_origins = get_cors_origins()
+current_env = os.environ.get("ENVIRONMENT", "development").lower()
+if current_env == "production":
+    effective_origins = cors_origins if cors_origins else ["https://dashboard.example.com"]
+    allow_creds = True
+else:
+    effective_origins = cors_origins if cors_origins else ["*"]
+    allow_creds = bool(cors_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=effective_origins,
+    allow_credentials=allow_creds,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+app.add_middleware(TrustedProxyHostMiddleware)
+app.add_middleware(ContentLengthLimitMiddleware)
 
 
 @app.get("/health")
@@ -774,6 +890,16 @@ async def resume_workflow(
             status_code=400,
             detail="Cannot resume workflow: already completed",
         )
+    if wf.status == WorkflowStatus.RUNNING:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot resume workflow: workflow is currently running",
+        )
+    if wf.status == WorkflowStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot resume workflow: workflow has been cancelled",
+        )
 
     tasks = await repository.get_workflow_tasks(workflow_id=workflow_id, tenant_id=tenant_id)
     checkpoint = await repository.get_latest_checkpoint(workflow_id=workflow_id, tenant_id=tenant_id)
@@ -828,12 +954,19 @@ async def resume_workflow(
             detail=f"Workflow resumption rejected: {assessment.reason}",
         )
 
-    # Atomically transition workflow to RUNNING
-    await repository.update_workflow_status(
-        workflow_id=workflow_id,
-        new_status=WorkflowStatus.RUNNING,
-        tenant_id=tenant_id,
-    )
+    # Atomically transition workflow to RUNNING with strict concurrency conflict defense
+    try:
+        await repository.update_workflow_status(
+            workflow_id=workflow_id,
+            new_status=WorkflowStatus.RUNNING,
+            tenant_id=tenant_id,
+            expected_status={WorkflowStatus.INTERRUPTED, WorkflowStatus.FAILED, WorkflowStatus.PENDING},
+        )
+    except ValueError as err:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot resume workflow: {err}",
+        )
 
     # Record successful resume attempt
     await repository.record_resume_attempt(
@@ -886,6 +1019,57 @@ async def resume_workflow(
         "reused_tasks": assessment.tasks_to_reuse,
         "completed_tasks_preserved": assessment.tasks_to_reuse,
         "resumed_tasks": assessment.tasks_to_resume,
+    }
+
+
+@app.post("/workflows/{workflow_id}/cancel")
+async def cancel_workflow_endpoint(
+    workflow_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+):
+    """Cancel a pending, running, or interrupted workflow with strict tenant isolation."""
+    tenant_id = None if auth.is_admin else auth.tenant_id
+    wf = await repository.get_workflow(workflow_id=workflow_id, tenant_id=tenant_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found or access denied")
+
+    if wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot cancel workflow: workflow is already in terminal state '{wf.status.value}'",
+        )
+
+    cancelled_wf = await repository.cancel_workflow(workflow_id=workflow_id, tenant_id=tenant_id)
+    if not cancelled_wf:
+        raise HTTPException(status_code=500, detail="Failed to cancel workflow")
+
+    await repository.record_audit_event(
+        AuditEvent(
+            event_id=f"aud_{uuid.uuid4().hex[:12]}",
+            tenant_id=wf.tenant_id,
+            actor=auth.actor,
+            action="workflow.cancelled",
+            resource_type="workflow",
+            resource_id=workflow_id,
+            metadata={"previous_status": wf.status.value},
+        )
+    )
+
+    await event_hub.publish_event(
+        TraceEvent(
+            event_id=f"evt_{uuid.uuid4().hex[:12]}",
+            workflow_id=workflow_id,
+            tenant_id=wf.tenant_id,
+            event_type="workflow.cancelled",
+            details={"actor": auth.actor, "previous_status": wf.status.value},
+        )
+    )
+
+    return {
+        "workflow_id": workflow_id,
+        "tenant_id": wf.tenant_id,
+        "status": "cancelled",
+        "cancelled": True,
     }
 
 
@@ -955,12 +1139,10 @@ async def get_policy(
     policy_id: str,
     auth: AuthContext = Depends(get_auth_context),
 ):
-    """Get policy by ID."""
+    """Get policy by ID (non-disclosing 404 on cross-tenant access)."""
     policy = await repository.get_policy(policy_id)
-    if not policy:
-        raise HTTPException(status_code=404, detail="Policy not found")
-    if not auth.is_admin and auth.tenant_id != policy.tenant_id:
-        raise HTTPException(status_code=403, detail="Access denied to tenant policy")
+    if not policy or (not auth.is_admin and auth.tenant_id != policy.tenant_id):
+        raise HTTPException(status_code=404, detail="Policy not found or access denied")
     return {"policy": policy.model_dump()}
 
 
@@ -1037,10 +1219,8 @@ async def activate_policy(
 ):
     """Activate a specific policy version."""
     policy = await repository.get_policy(policy_id)
-    if not policy:
-        raise HTTPException(status_code=404, detail="Policy not found")
-    if not auth.is_admin and auth.tenant_id != policy.tenant_id:
-        raise HTTPException(status_code=403, detail="Access denied to tenant policy")
+    if not policy or (not auth.is_admin and auth.tenant_id != policy.tenant_id):
+        raise HTTPException(status_code=404, detail="Policy not found or access denied")
 
     success = await repository.activate_policy(policy_id, policy.tenant_id)
     if not success:
@@ -1070,10 +1250,8 @@ async def rollback_policy(
 ):
     """Roll back to a previous valid policy version."""
     policy = await repository.get_policy(policy_id)
-    if not policy:
-        raise HTTPException(status_code=404, detail="Target rollback policy not found")
-    if not auth.is_admin and auth.tenant_id != policy.tenant_id:
-        raise HTTPException(status_code=403, detail="Access denied to tenant policy")
+    if not policy or (not auth.is_admin and auth.tenant_id != policy.tenant_id):
+        raise HTTPException(status_code=404, detail="Target rollback policy not found or access denied")
 
     success = await repository.activate_policy(policy_id, policy.tenant_id)
     if not success:
@@ -1139,9 +1317,17 @@ async def decide_reconciliation(
     if not rec:
         raise HTTPException(status_code=404, detail="Reconciliation case not found or access denied")
 
+    # Guard against conflicting operator decisions on already resolved/rejected cases
+    if rec.status in (ReconciliationStatus.RESOLVED, ReconciliationStatus.REJECTED):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Reconciliation case is already in terminal state '{rec.status.value}'",
+        )
+
     action = req.action.lower()
+    cleaned_idempotency_key = req.idempotency_key.strip() if req.idempotency_key else None
     if action == "approve_retry":
-        if not req.risk_acknowledged and not req.idempotency_key:
+        if not req.risk_acknowledged and not cleaned_idempotency_key:
             raise HTTPException(
                 status_code=400,
                 detail=(

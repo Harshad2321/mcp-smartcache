@@ -41,6 +41,7 @@ services:
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
       GATEWAY_ADMIN_API_KEY: ${GATEWAY_ADMIN_API_KEY:-dev-admin-secret-key-32chars-long}
       GATEWAY_CLIENT_API_KEY: ${GATEWAY_CLIENT_API_KEY:-dev-client-secret-key-32chars-long}
+      CLIENT_TENANT_KEYS: ${CLIENT_TENANT_KEYS:-dev-client-secret-key-tenant-a-32ch:tenant_a,dev-client-secret-key-tenant-b-32ch:tenant_b}
     volumes:
       - .:/app
     ports:
@@ -72,7 +73,7 @@ services:
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
       GATEWAY_ADMIN_API_KEY: ${GATEWAY_ADMIN_API_KEY:-dev-admin-secret-key-32chars-long}
       GATEWAY_CLIENT_API_KEY: ${GATEWAY_CLIENT_API_KEY:-dev-client-secret-key-32chars-long}
-      CLIENT_TENANT_KEYS: ${CLIENT_TENANT_KEYS:-dev-client-secret-key-32chars-long:tenant_a,dev-client-secret-key-tenant-b-32ch:tenant_b}
+      CLIENT_TENANT_KEYS: ${CLIENT_TENANT_KEYS:-dev-client-secret-key-tenant-a-32ch:tenant_a,dev-client-secret-key-tenant-b-32ch:tenant_b}
     volumes:
       - .:/app
     ports:

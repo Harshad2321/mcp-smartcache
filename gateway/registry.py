@@ -14,6 +14,8 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
 
+from gateway.outbound_transport import create_safe_mcp_http_client, SSRFSecurityViolation
+
 logger = logging.getLogger(__name__)
 
 TransportType = Literal["stdio", "sse", "in-process"]
@@ -111,7 +113,11 @@ class ServerRegistry:
             headers = config.connection_config.get("headers", {})
             timeout = float(config.connection_config.get("timeout", 10.0))
             try:
-                async with sse_client(url, headers=headers) as (read_stream, write_stream):
+                async with sse_client(
+                    url,
+                    headers=headers,
+                    httpx_client_factory=create_safe_mcp_http_client,
+                ) as (read_stream, write_stream):
                     async with ClientSession(read_stream, write_stream) as session:
                         await asyncio.wait_for(session.initialize(), timeout=timeout)
                         result = await asyncio.wait_for(session.list_tools(), timeout=timeout)
