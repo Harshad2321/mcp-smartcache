@@ -116,6 +116,7 @@ def test_production_startup_validation_rejects_weak_or_dev_credentials():
             "ENVIRONMENT": "production",
             "AUTH_ENABLED": "true",
             "GATEWAY_ADMIN_API_KEY": "prod-admin-secret-key-sufficiently-long-32chars",
+            "GATEWAY_CLIENT_API_KEY": "prod-client-secret-key-sufficiently-long-32chars",
             "CLIENT_TENANT_KEYS": "dev-tenant-key-123456:tenant_a",
         },
     ):
